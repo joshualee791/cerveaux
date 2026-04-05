@@ -11,7 +11,8 @@ import {
   toClaudeMessages,
   toOpenAiTurns,
 } from "@/lib/chat-helpers";
-import { classifyRoute } from "@/lib/router/classify";
+import { DEFAULT_CONVERSATION_TITLE } from "@/lib/conversation-defaults";
+import { classifyRoute, type RouteLabel } from "@/lib/router/classify";
 import { getAgentMemory } from "@/lib/memory/read";
 import { scheduleMemorySummarization } from "@/lib/memory/summarize";
 import { prisma } from "@/lib/prisma";
@@ -53,6 +54,41 @@ function toDto(m: Message): ChatMessageDTO {
     sequence: m.sequence,
     createdAt: m.createdAt.toISOString(),
   };
+}
+
+/**
+ * Deterministic explicit addressee — overrides Haiku classification when set.
+ * @mention wins by first occurrence; else leading Marie:/Roy:/@…/name at line start.
+ */
+function explicitAgentTarget(raw: string): "marie" | "roy" | null {
+  const t = raw.trim();
+  if (!t) return null;
+
+  const idxMarie = t.search(/@marie\b/i);
+  const idxRoy = t.search(/@roy\b/i);
+  if (idxMarie >= 0 || idxRoy >= 0) {
+    if (idxRoy === -1 || (idxMarie >= 0 && idxMarie <= idxRoy)) {
+      return "marie";
+    }
+    return "roy";
+  }
+
+  if (
+    /^marie\s*:/i.test(t) ||
+    /^marie\s*\?/i.test(t) ||
+    /^marie\b/i.test(t)
+  ) {
+    return "marie";
+  }
+  if (
+    /^roy\s*:/i.test(t) ||
+    /^roy\s*\?/i.test(t) ||
+    /^roy\b/i.test(t)
+  ) {
+    return "roy";
+  }
+
+  return null;
 }
 
 function ndjsonResponse(
@@ -145,12 +181,20 @@ export async function POST(req: Request) {
     },
   });
 
-  let route: Awaited<ReturnType<typeof classifyRoute>>;
-  try {
-    route = await classifyRoute(raw, prior);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "Router failed";
-    return NextResponse.json({ error: msg }, { status: 502 });
+  const targeted = explicitAgentTarget(raw);
+
+  let route: RouteLabel;
+  if (targeted === "marie") {
+    route = "MARIE_ONLY";
+  } else if (targeted === "roy") {
+    route = "ROY_ONLY";
+  } else {
+    try {
+      route = await classifyRoute(raw, prior);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Router failed";
+      return NextResponse.json({ error: msg }, { status: 502 });
+    }
   }
 
   const historyAfterUser = await prisma.message.findMany({
@@ -266,10 +310,20 @@ export async function POST(req: Request) {
       orderBy: { sequence: "asc" },
     });
 
+    const nextTitle =
+      conversation.title === DEFAULT_CONVERSATION_TITLE
+        ? titleFromFirstMessage(raw)
+        : conversation.title;
+
+    const updatedConversation = await prisma.conversation.update({
+      where: { id: convId },
+      data: { title: nextTitle },
+    });
+
     send({
       type: "done",
       conversationId: convId,
-      conversationTitle: conversation.title,
+      conversationTitle: updatedConversation.title,
       messages: messages.map(toDto),
     });
 

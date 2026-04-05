@@ -24,6 +24,7 @@ export const config = {
     "/api/upload",
     "/api/conversation",
     "/api/conversation/:path*",
+    "/api/conversations",
     "/api/memory/:path*",
   ],
 };

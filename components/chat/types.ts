@@ -10,3 +10,12 @@ export type ChatMessageDTO = {
   /** Client-only: primary reply streaming in progress */
   streaming?: boolean;
 };
+
+/** GET /api/conversations item — optional preview from last message. */
+export type ConversationListItem = {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  preview?: string;
+};

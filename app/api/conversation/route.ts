@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
+import { DEFAULT_CONVERSATION_TITLE } from "@/lib/conversation-defaults";
 import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
-
-const DEFAULT_TITLE = "New Conversation";
 
 /**
  * Create an empty conversation for testing / reset. No thread list UI — client uses returned id only.
@@ -17,7 +16,7 @@ export async function POST() {
   }
 
   const conversation = await prisma.conversation.create({
-    data: { title: DEFAULT_TITLE },
+    data: { title: DEFAULT_CONVERSATION_TITLE },
   });
 
   return NextResponse.json({

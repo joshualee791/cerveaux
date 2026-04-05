@@ -12,6 +12,7 @@ datasource db {
 model Conversation {
   id        String    @id @default(uuid()) @db.Uuid
   createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at")
   title     String
   /// Message count in this thread when memory summarization last succeeded (Phase 7 checkpoint).
   memoryCheckpointMessageCount Int @default(0) @map("memory_checkpoint_message_count")

@@ -17,7 +17,7 @@ export async function GET() {
   }
 
   const latest = await prisma.conversation.findFirst({
-    orderBy: { createdAt: "desc" },
+    orderBy: { updatedAt: "desc" },
   });
 
   if (!latest) {

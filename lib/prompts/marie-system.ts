@@ -109,6 +109,8 @@ export function buildMarieSystemPrompt(
 ${JOSHUA_CONTEXT_BLOCK}
 
 --- YOUR MEMORY ---
+Background for continuity only — lead with the current message; do not recite or foreground these notes unless they clearly help.
+
 What you know about Joshua:
 ${marie_memory_joshua}
 

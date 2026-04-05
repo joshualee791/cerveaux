@@ -4,18 +4,20 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChatInput } from "./chat-input";
 import { ConversationSidebar } from "./conversation-sidebar";
 import { MessageThread } from "./message-thread";
-import type { ChatMessageDTO } from "./types";
+import type { ChatMessageDTO, ConversationListItem } from "./types";
 
 type Props = {
   userName: string;
 };
 
-type LatestResponse = {
-  conversation: {
-    conversationId: string;
-    title: string;
-    messages: ChatMessageDTO[];
-  } | null;
+type ConversationsResponse = {
+  conversations: ConversationListItem[];
+};
+
+type MessagesResponse = {
+  conversationId: string;
+  title: string;
+  messages: ChatMessageDTO[];
 };
 
 type NdjsonEvent =
@@ -45,7 +47,7 @@ function nextSequence(msgs: ChatMessageDTO[]): number {
   return Math.max(...msgs.map((m) => m.sequence)) + 1;
 }
 
-/** Remove pending optimistic user + streaming placeholder (e.g. on error). */
+/** Remove pending optimistic user + streaming placeholder (e.g. on error or switch). */
 function stripOptimistic(msgs: ChatMessageDTO[]): ChatMessageDTO[] {
   return msgs.filter(
     (m) => m.id !== OPTIMISTIC_USER_ID && m.id !== "__streaming__",
@@ -54,16 +56,22 @@ function stripOptimistic(msgs: ChatMessageDTO[]): ChatMessageDTO[] {
 
 export function ChatApp({ userName }: Props) {
   const [conversationId, setConversationId] = useState<string | null>(null);
-  const [conversationTitle, setConversationTitle] = useState<string | null>(
-    null,
-  );
   const [messages, setMessages] = useState<ChatMessageDTO[]>([]);
+  const [conversations, setConversations] = useState<ConversationListItem[]>(
+    [],
+  );
   const [loadError, setLoadError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
   const [loadingThread, setLoadingThread] = useState(true);
+  const [loadingList, setLoadingList] = useState(true);
+  const [loadingConversation, setLoadingConversation] = useState(false);
   const [sending, setSending] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const scrollEndRef = useRef<HTMLDivElement>(null);
+  const beforeSwitchRef = useRef<{
+    conversationId: string | null;
+    messages: ChatMessageDTO[];
+  } | null>(null);
 
   const scrollToBottom = useCallback(() => {
     scrollEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -73,29 +81,48 @@ export function ChatApp({ userName }: Props) {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
+  const refreshConversations = useCallback(async () => {
+    const res = await fetch("/api/conversations");
+    if (!res.ok) return;
+    const data = (await res.json()) as ConversationsResponse;
+    setConversations(data.conversations);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
     (async () => {
       setLoadingThread(true);
+      setLoadingList(true);
       setLoadError(null);
       try {
-        const res = await fetch("/api/conversation/latest");
-        if (!res.ok) {
-          throw new Error(`Failed to load conversation (${res.status})`);
+        const listRes = await fetch("/api/conversations");
+        if (!listRes.ok) {
+          throw new Error(`Failed to load conversations (${listRes.status})`);
         }
-        const data = (await res.json()) as LatestResponse;
+        const listData = (await listRes.json()) as ConversationsResponse;
         if (cancelled) return;
+        setConversations(listData.conversations);
+        setLoadingList(false);
 
-        if (data.conversation) {
-          setConversationId(data.conversation.conversationId);
-          setConversationTitle(data.conversation.title);
-          setMessages(data.conversation.messages);
-        } else {
+        if (listData.conversations.length === 0) {
           setConversationId(null);
-          setConversationTitle(null);
           setMessages([]);
+          setLoadingThread(false);
+          return;
         }
+
+        const first = listData.conversations[0];
+        const msgRes = await fetch(
+          `/api/conversation/${encodeURIComponent(first.id)}/messages`,
+        );
+        if (!msgRes.ok) {
+          throw new Error(`Failed to load messages (${msgRes.status})`);
+        }
+        const msgData = (await msgRes.json()) as MessagesResponse;
+        if (cancelled) return;
+        setConversationId(msgData.conversationId);
+        setMessages(msgData.messages);
       } catch (e) {
         if (!cancelled) {
           setLoadError(
@@ -111,6 +138,58 @@ export function ChatApp({ userName }: Props) {
       cancelled = true;
     };
   }, []);
+
+  async function selectConversation(id: string) {
+    if (
+      sending ||
+      creatingConversation ||
+      loadingConversation ||
+      loadingList
+    ) {
+      return;
+    }
+    if (id === conversationId) return;
+
+    beforeSwitchRef.current = {
+      conversationId,
+      messages: stripOptimistic(messages),
+    };
+    setLoadingConversation(true);
+    setSendError(null);
+    setMessages([]);
+    setConversationId(id);
+
+    try {
+      const res = await fetch(
+        `/api/conversation/${encodeURIComponent(id)}/messages`,
+      );
+      const data = (await res.json().catch(() => ({}))) as
+        | MessagesResponse
+        | { error?: string };
+      if (!res.ok) {
+        throw new Error(
+          typeof (data as { error?: string }).error === "string"
+            ? (data as { error: string }).error
+            : `Error (${res.status})`,
+        );
+      }
+      const ok = data as MessagesResponse;
+      setMessages(ok.messages);
+      beforeSwitchRef.current = null;
+    } catch (e) {
+      setSendError(
+        e instanceof Error ? e.message : "Could not load conversation.",
+      );
+      const prev = beforeSwitchRef.current;
+      if (prev) {
+        setConversationId(prev.conversationId);
+        setMessages(prev.messages);
+      }
+      beforeSwitchRef.current = null;
+    } finally {
+      setLoadingConversation(false);
+    }
+  }
 
   async function handleNewConversation() {
     setSendError(null);
@@ -131,8 +210,8 @@ export function ChatApp({ userName }: Props) {
         throw new Error("Invalid response from server.");
       }
       setConversationId(data.conversationId);
-      setConversationTitle(data.title ?? "New Conversation");
       setMessages([]);
+      await refreshConversations();
     } catch (e) {
       setSendError(
         e instanceof Error ? e.message : "Could not start a new conversation.",
@@ -211,7 +290,6 @@ export function ChatApp({ userName }: Props) {
                 ? Math.max(...ev.messages.map((m) => m.sequence))
                 : 0;
             setConversationId(ev.conversationId);
-            setConversationTitle(ev.conversationTitle);
             setMessages([
               ...ev.messages,
               {
@@ -245,8 +323,8 @@ export function ChatApp({ userName }: Props) {
             break;
           case "done":
             setConversationId(ev.conversationId);
-            setConversationTitle(ev.conversationTitle);
             setMessages(ev.messages);
+            void refreshConversations();
             break;
           case "error":
             setSendError(ev.error);
@@ -283,14 +361,19 @@ export function ChatApp({ userName }: Props) {
     }
   }
 
+  const navLocked =
+    sending || creatingConversation || loadingConversation || loadingList;
+
   return (
     <div className="flex h-[100dvh] flex-col bg-neutral-50 text-neutral-900 md:flex-row">
       <ConversationSidebar
-        conversationTitle={conversationTitle}
+        conversations={conversations}
+        activeConversationId={conversationId}
+        onSelectConversation={(id) => void selectConversation(id)}
         onNewConversation={handleNewConversation}
-        newConversationDisabled={
-          loadingThread || sending || creatingConversation
-        }
+        newConversationDisabled={navLocked}
+        selectDisabled={navLocked}
+        loadingList={loadingList}
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <header className="shrink-0 border-b border-neutral-200 bg-white px-4 py-3">
@@ -312,12 +395,12 @@ export function ChatApp({ userName }: Props) {
         <MessageThread
           userName={userName}
           messages={messages}
-          loading={loadingThread}
+          loading={loadingThread || loadingConversation}
           scrollEndRef={scrollEndRef}
         />
         <ChatInput
           onSend={handleSend}
-          disabled={sending || loadingThread}
+          disabled={sending || loadingThread || loadingConversation}
           placeholder="Message…"
         />
       </div>

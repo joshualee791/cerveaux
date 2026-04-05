@@ -52,7 +52,7 @@ function buildSummarizerPrompt(params: {
   currentCounterpart: string;
   transcript: string;
 }): string {
-  return `You are updating persistent memory for ${params.agentName}.
+  return `You are updating persistent memory for ${params.agentName} (this agent's long-term notes — not a transcript summary).
 
 Current memory about Joshua:
 ${params.currentJoshua || "(empty)"}
@@ -63,11 +63,55 @@ ${params.currentCounterpart || "(empty)"}
 New conversation:
 ${params.transcript}
 
-Update both memory blocks to reflect anything new, changed, or worth retaining.
+Your job is to COMPRESS durable signal — not to paraphrase the chat. Each block must stay selective and stable across future turns.
+
+KEEP (when clearly supported by the thread or prior memory):
+- Durable preferences, recurring patterns, and interaction style
+- Stable project/system or tooling preferences that matter for future turns
+- For "counterpart": how ${params.counterpartName} tends to differ from ${params.agentName} in lens or emphasis — useful for coordination, NOT copying their voice or absorbing their role
+
+AVOID:
+- Transient moods, one-off jokes, throwaway trivia unless clearly important later
+- Over-personal, speculative, or "creepy" inferences about the user
+- Redundant restatements of the Joshua context block or obvious facts
+- Exaggerated certainty; hedge when inference is thin
+- Turning counterpart memory into mimicry of the other agent — describe differences that help ${params.agentName}, not roleplay as the other
+
+If this session adds no important new signal, return the previous memory content for that block (or minimally edit). Do NOT rewrite aggressively when nothing material changed.
+
 Return only valid JSON — no preamble, no markdown:
 { "joshua": "...", "counterpart": "..." }
 
-Keep each block under 500 words. Prioritize signal. Cut noise.`;
+Keep each block under 500 words. Prioritize signal; cut noise.`;
+}
+
+/**
+ * Avoid overwriting solid memory with empty or collapsed low-signal model output.
+ */
+function mergeMemoryField(previous: string, candidate: string): string {
+  const next = candidate.trim();
+  const prev = previous.trim();
+  if (next.length === 0) {
+    return previous;
+  }
+  if (prev.length >= 80 && next.length < 30) {
+    console.log("[memory/summarize] mergeMemoryField: kept prior (candidate suspiciously short)", {
+      prevLen: prev.length,
+      nextLen: next.length,
+    });
+    return previous;
+  }
+  return candidate;
+}
+
+function mergeAgentMemorySnapshot(
+  before: { joshua: string; counterpart: string },
+  candidate: { joshua: string; counterpart: string },
+): { joshua: string; counterpart: string } {
+  return {
+    joshua: mergeMemoryField(before.joshua, candidate.joshua),
+    counterpart: mergeMemoryField(before.counterpart, candidate.counterpart),
+  };
 }
 
 async function upsertMemoryRow(
@@ -236,16 +280,20 @@ async function runMemorySummarization(conversationId: string): Promise<void> {
   let marie: { joshua: string; counterpart: string };
   let roy: { joshua: string; counterpart: string };
 
+  const memoryBeforeMarie = await getAgentMemory("marie");
+  const memoryBeforeRoy = await getAgentMemory("roy");
+
   console.log("[memory/debug] Marie summarization starting", {
     conversationId,
     transcriptChars: transcript.length,
   });
   try {
-    marie = await callSummarizerForAgent({
+    const marieRaw = await callSummarizerForAgent({
       agent: "marie",
       counterpartLabel: "Roy",
       transcript,
     });
+    marie = mergeAgentMemorySnapshot(memoryBeforeMarie, marieRaw);
     console.log("[memory/debug] Marie summarization finished ok", {
       conversationId,
     });
@@ -260,11 +308,12 @@ async function runMemorySummarization(conversationId: string): Promise<void> {
 
   console.log("[memory/debug] Roy summarization starting", { conversationId });
   try {
-    roy = await callSummarizerForAgent({
+    const royRaw = await callSummarizerForAgent({
       agent: "roy",
       counterpartLabel: "Marie",
       transcript,
     });
+    roy = mergeAgentMemorySnapshot(memoryBeforeRoy, royRaw);
     console.log("[memory/debug] Roy summarization finished ok", {
       conversationId,
     });
