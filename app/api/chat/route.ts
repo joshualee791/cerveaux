@@ -109,9 +109,21 @@ function trailingExplicitAgentTarget(t: string): "marie" | "roy" | null {
 }
 
 /**
+ * Mid-message direct address: "Roy can you …", "Marie what …" — bounded to avoid
+ * casual mentions ("Roy can swim"). Runs after @mentions per priority order.
+ */
+function naturalAddressExplicitTarget(t: string): "marie" | "roy" | null {
+  const re =
+    /\b(roy|marie)\b,?\s+(?:can\s+you|could\s+you|would\s+you|will\s+you|would\s+you\s+mind|what|how|please|do\s+you|did\s+you)\b/gi;
+  const m = re.exec(t);
+  if (!m) return null;
+  return m[1].toLowerCase() === "roy" ? "roy" : "marie";
+}
+
+/**
  * Deterministic explicit addressee — overrides Haiku classification when set.
- * Leading address (incl. greeting + Marie/Roy) first; else trailing ", Roy" / ", Marie";
- * else global @marie/@roy by first occurrence.
+ * Priority: leading address; trailing ", Roy" / ", Marie"; @marie/@roy;
+ * natural mid-message direct address (e.g. "lol well done. Roy can you …").
  */
 function explicitAgentTarget(raw: string): "marie" | "roy" | null {
   const t = raw.trim();
@@ -131,6 +143,9 @@ function explicitAgentTarget(raw: string): "marie" | "roy" | null {
     }
     return "roy";
   }
+
+  const natural = naturalAddressExplicitTarget(t);
+  if (natural) return natural;
 
   return null;
 }
