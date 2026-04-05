@@ -530,8 +530,8 @@ GET    /api/conversation/:id/uploads
 ## 15. Authentication
 
 - NextAuth.js credentials provider, single user
-- Password hashed at rest with bcrypt (cost factor 12)
-- Compare with `bcrypt.compare()` — never string equality
+- Password hashed at rest with bcrypt-compatible hashes (cost factor 12); runtime uses **bcryptjs** (pure JS, Vercel-compatible)
+- Compare with `bcrypt.compare()` from bcryptjs — never string equality
 - JWT in httpOnly, Secure, SameSite=Strict cookie
 - 7-day sliding session
 - Same JWT secret across devices = cross-device continuity
@@ -589,7 +589,7 @@ ANTHROPIC_API_KEY    — Claude (Marie + summarization + router)
 OPENAI_API_KEY       — OpenAI (Roy)
 DATABASE_URL         — Neon Postgres connection string
 NEXTAUTH_SECRET      — JWT signing key (openssl rand -base64 32)
-HASHED_PASSWORD      — bcrypt hash of login password
+HASHED_PASSWORD      — bcrypt-compatible hash of login password (generate with bcryptjs; see .env.example)
 ```
 
 **Optional overrides (defaults in code if unset):**
