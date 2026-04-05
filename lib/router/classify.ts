@@ -47,6 +47,7 @@ function hasStrongEmotionalSignal(message: string): boolean {
 /**
  * When the model returns PRIMARY but the message clearly fits one domain,
  * prefer a single agent. When both domains fire, treat as genuinely mixed — keep the model label.
+ * Does not rewrite ROY_ONLY → MARIE_ONLY on technical heuristics (explicit / classifier Roy must stay Roy).
  */
 function applyDomainSignals(
   message: string,
@@ -59,11 +60,7 @@ function applyDomainSignals(
     return label;
   }
   if (technical) {
-    if (
-      label === "MARIE_PRIMARY" ||
-      label === "ROY_PRIMARY" ||
-      label === "ROY_ONLY"
-    ) {
+    if (label === "MARIE_PRIMARY" || label === "ROY_PRIMARY") {
       return "MARIE_ONLY";
     }
     return label;

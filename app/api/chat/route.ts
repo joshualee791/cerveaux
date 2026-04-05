@@ -13,6 +13,11 @@ import {
 } from "@/lib/chat-helpers";
 import { DEFAULT_CONVERSATION_TITLE } from "@/lib/conversation-defaults";
 import { classifyRoute, type RouteLabel } from "@/lib/router/classify";
+import {
+  buildCrossAgentReferenceContextAppend,
+  detectCrossAgentReference,
+  recentReferencedAgentContextWindow,
+} from "@/lib/router/cross-agent-reference";
 import { getAgentMemory } from "@/lib/memory/read";
 import { scheduleMemorySummarization } from "@/lib/memory/summarize";
 import { prisma } from "@/lib/prisma";
@@ -56,13 +61,51 @@ function toDto(m: Message): ChatMessageDTO {
   };
 }
 
+/** Optional opener so "Hey Roy, …" resolves before global @mentions. */
+const LEADING_GREETING = /^(?:Hi|Hey|Hello|Ok|Okay|So|Well)(?:,|\s+)\s*/i;
+
+/**
+ * Leading addressee only (after trim). Greeting + Marie/Roy/@marie/@roy at effective start.
+ * Checked before global @mention scan so "Roy, … @marie" still targets Roy.
+ */
+function leadingExplicitAgentTarget(t: string): "marie" | "roy" | null {
+  let s = t;
+  const gm = t.match(LEADING_GREETING);
+  if (gm) {
+    s = t.slice(gm[0].length);
+  }
+  if (!s) return null;
+
+  if (/^@marie\b/i.test(s)) return "marie";
+  if (/^@roy\b/i.test(s)) return "roy";
+
+  if (
+    /^marie\s*:/i.test(s) ||
+    /^marie\s*\?/i.test(s) ||
+    /^marie\b/i.test(s)
+  ) {
+    return "marie";
+  }
+  if (
+    /^roy\s*:/i.test(s) ||
+    /^roy\s*\?/i.test(s) ||
+    /^roy\b/i.test(s)
+  ) {
+    return "roy";
+  }
+  return null;
+}
+
 /**
  * Deterministic explicit addressee — overrides Haiku classification when set.
- * @mention wins by first occurrence; else leading Marie:/Roy:/@…/name at line start.
+ * Leading address (incl. greeting + Marie/Roy) first; else global @marie/@roy by first occurrence.
  */
 function explicitAgentTarget(raw: string): "marie" | "roy" | null {
   const t = raw.trim();
   if (!t) return null;
+
+  const leading = leadingExplicitAgentTarget(t);
+  if (leading) return leading;
 
   const idxMarie = t.search(/@marie\b/i);
   const idxRoy = t.search(/@roy\b/i);
@@ -70,21 +113,6 @@ function explicitAgentTarget(raw: string): "marie" | "roy" | null {
     if (idxRoy === -1 || (idxMarie >= 0 && idxMarie <= idxRoy)) {
       return "marie";
     }
-    return "roy";
-  }
-
-  if (
-    /^marie\s*:/i.test(t) ||
-    /^marie\s*\?/i.test(t) ||
-    /^marie\b/i.test(t)
-  ) {
-    return "marie";
-  }
-  if (
-    /^roy\s*:/i.test(t) ||
-    /^roy\s*\?/i.test(t) ||
-    /^roy\b/i.test(t)
-  ) {
     return "roy";
   }
 
@@ -205,9 +233,44 @@ export async function POST(req: Request) {
   const streamingRole: "marie" | "roy" =
     route === "MARIE_ONLY" || route === "MARIE_PRIMARY" ? "marie" : "roy";
 
+  const executingPrimary =
+    route === "MARIE_ONLY" || route === "MARIE_PRIMARY"
+      ? "streamMarie"
+      : "streamRoy";
+  console.log("[router/debug]", {
+    explicitTarget:
+      targeted === null ? null : targeted === "marie" ? "MARIE" : "ROY",
+    finalRoute: route,
+    executing: executingPrimary,
+    streamingRole,
+    classifierSkipped: targeted !== null,
+  });
+
   const startMessages: ChatMessageDTO[] = historyAfterUser.map(toDto);
 
   return ndjsonResponse(async (send) => {
+    let crossAgentAppend: string | undefined;
+    if (
+      (route === "MARIE_ONLY" || route === "ROY_ONLY") &&
+      targeted &&
+      targeted === streamingRole
+    ) {
+      const referenced = detectCrossAgentReference(raw, streamingRole);
+      if (referenced) {
+        const refWindow = recentReferencedAgentContextWindow(
+          historyAfterUser,
+          referenced,
+        );
+        crossAgentAppend = buildCrossAgentReferenceContextAppend(
+          referenced,
+          refWindow.map((m) => ({
+            sequence: m.sequence,
+            content: m.content,
+          })),
+        );
+      }
+    }
+
     send({
       type: "start",
       conversationId: convId,
@@ -232,13 +295,18 @@ export async function POST(req: Request) {
       primaryText = await streamMarie(claudeMessages, {
         onDelta,
         memory: primaryMem,
+        systemAppend: crossAgentAppend,
       });
     } else {
       const turns = toOpenAiTurns(historyAfterUser);
       if (turns.length === 0) {
         throw new Error("Internal error: empty Roy context");
       }
-      primaryText = await streamRoy(turns, { onDelta, memory: primaryMem });
+      primaryText = await streamRoy(turns, {
+        onDelta,
+        memory: primaryMem,
+        systemAppend: crossAgentAppend,
+      });
     }
 
     const primaryRole = streamingRole;
