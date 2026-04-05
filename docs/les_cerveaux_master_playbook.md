@@ -5,7 +5,7 @@
 
 ## 1. System Overview
 
-Les Cerveaux is a personal multi-agent conversational system. Two AI identities — Marie (Claude) and Roy (GPT-4o) — share a single chat interface, maintain independent persistent memory, and respond to the user with distinct voices and perspectives. The user can upload files into any conversation thread for both agents to ingest and reason over.
+Les Cerveaux is a personal multi-agent conversational system. Two AI identities — Marie (Claude) and Roy (OpenAI, default **GPT-4.1**, configurable) — share a single chat interface, maintain independent persistent memory, and respond to the user with distinct voices and perspectives. The user can upload files into any conversation thread for both agents to ingest and reason over.
 
 **Design principles:**
 - Conversation first. Structure when useful. Execution when intentional.
@@ -51,9 +51,10 @@ Les Cerveaux is a personal multi-agent conversational system. Two AI identities 
 
 **conversations**
 ```sql
-id          uuid primary key
-created_at  timestamp
-title       text
+id                              uuid primary key
+created_at                      timestamp
+title                           text
+memory_checkpoint_message_count integer not null default 0  -- last summarization checkpoint for this thread
 ```
 
 **messages**
@@ -92,34 +93,20 @@ uploaded_at     timestamp
 
 ## 4. Routing Logic
 
-**Rules evaluated in order:**
+Routing is **Haiku classification** (`lib/router/classify.ts`) plus **domain-signal tightening**. Model is configurable (`ANTHROPIC_ROUTER_MODEL`, default `claude-haiku-4-5`).
 
-1. Explicit address — message contains "Marie" or "Roy" → route to that agent only
-2. Strong domain signal:
-   - Clearly technical / architectural / systems → Marie only
-   - Clearly conceptual / philosophical / emotional → Roy only
-3. Continuation — direct follow-up to a prior single-agent response → same agent
-4. Default → BOTH
+**Default outcomes are single-agent:** `MARIE_ONLY` or `ROY_ONLY`. The classifier is instructed to use **`MARIE_PRIMARY` / `ROY_PRIMARY` sparingly** — only when the message clearly benefits from two perspectives or is explicitly mixed (technical + human/meaning without a clear lean).
 
-**When BOTH: primary/secondary assignment**
+**PRIMARY states are rare, not the default.** `ROY_PRIMARY` is **not** the fallback when parsing fails (fallback is `ROY_ONLY`).
 
-- Technical lean → Marie primary, Roy secondary
-- Everything else → Roy primary, Marie secondary
-- Genuinely ambiguous → Roy primary, Marie secondary
+**Strong technical signals** (e.g. design, architecture, API, database, scaling) bias toward **`MARIE_ONLY`** when not clearly mixed. **Strong emotional/conceptual signals** (e.g. “I feel…”, “I’m stuck…”, “something feels off…”) bias toward **`ROY_ONLY`** when not clearly mixed. When both signal types appear, the model label is left as-is (genuinely mixed).
 
-**Classification prompt (Haiku):**
-```
-Given this user message, respond with exactly one of:
-MARIE_ONLY, ROY_ONLY, MARIE_PRIMARY, ROY_PRIMARY
+**When BOTH is chosen (`MARIE_PRIMARY` / `ROY_PRIMARY`): primary/secondary assignment**
 
-MARIE_ONLY: explicitly addressed to Marie, or unambiguously technical/architectural
-ROY_ONLY: explicitly addressed to Roy, or unambiguously conceptual/philosophical/emotional
-MARIE_PRIMARY: technical lean but warrants both perspectives, Marie responds first
-ROY_PRIMARY: default — ambiguous, general, or mixed signal, Roy responds first
+- `MARIE_PRIMARY` — Marie responds first, then Roy with deferral
+- `ROY_PRIMARY` — Roy responds first, then Marie with deferral
 
-Message: {{user_message}}
-Prior turn agent (if continuation): {{prior_agent}}
-```
+**Classification prompt (summary — see code for verbatim text):** labels `MARIE_ONLY`, `ROY_ONLY`, `MARIE_PRIMARY`, `ROY_PRIMARY`; prior assistant role passed for continuation; instructions favor single-agent answers unless mixed or dual-perspective value is clear.
 
 ---
 
@@ -340,7 +327,19 @@ What you know about Marie:
 
 ---
 
+## 8.5 Response calibration (current implementation)
+
+End-of-prompt **RESPONSE CALIBRATION** blocks in `lib/prompts/marie-system.ts` and `lib/prompts/roy-system.ts` tune reply shape without changing §7/§8 identity text.
+
+**Roy:** Engage the **substance of the question first**; do not open by analyzing Joshua’s behavior, intent, or input patterns. Assume good intent; challenge **ideas** collaboratively — not sharply or dismissively. Avoid clever edge, rhetorical flourish, or performative intelligence. Do not escalate ambiguity into meta-analysis unless Joshua invites it. One clarifying question only when needed to proceed. Grounded, calm, conversational tone; brevity when appropriate.
+
+**Marie:** Do **not** disengage or withhold because the turn is not explicitly technical — interpret through structure, signal, or decisions. Assume there is something to work with; surface structure rather than waiting for a “formal” technical problem. Do not open by diagnosing Joshua or pattern-detecting his input. If context is missing, state a reasonable assumption, proceed, then invite correction. Directness remains; sharpness targets **ideas, systems, and decisions** — not Joshua personally.
+
+---
+
 ## 9. Joshua Context Block (shared, semi-static)
+
+Source of truth in code: `lib/prompts/joshua-context.ts`. No single named product is assumed default context for API or systems questions.
 
 ```
 Joshua is 39. Web Operations Specialist at My Social Practice (dental marketing
@@ -352,10 +351,10 @@ He thinks in systems. He arrives already oriented. He does not need preamble,
 re-explanation, or validation. He communicates directly with dry humor. Occasional
 profanity is a comfort signal, not frustration.
 
-He is building Clarion — a white-label multi-tenant martech SaaS for dental
-marketing agencies. His own IP, built outside his employer deliberately. Stack:
-Next.js, Node/Fastify/TypeScript, tRPC, Postgres/Prisma, Clerk, BullMQ, GCP,
-Cloudflare.
+He explores multi-tenant martech and SaaS ideas for agency markets—including
+dental—as side IP, distinct from his employer. His typical stack vocabulary
+includes Next.js, Node/Fastify/TypeScript, tRPC, Postgres/Prisma, Clerk, BullMQ,
+GCP, Cloudflare.
 
 Long game: relocate to Spain or France after the MBA. Quality of life over income.
 Fluent in French (B2). Family roots in Galicia.
@@ -367,11 +366,17 @@ He does not want sycophancy. He wants honest pushback when warranted.
 
 ## 10. Memory System
 
-**Trigger conditions — whichever comes first:**
-- 10–15 messages since last summarization
-- 5–10 minutes of inactivity in the thread
+**Read:** On each Marie or Roy call, load two rows from `memory`: `scope = 'joshua'` and `scope = 'counterpart'` for that agent. Missing rows → empty strings. Injected into the **YOUR MEMORY** sections of the system prompt. No vector search at MVP.
 
-Both tracked server-side. setTimeout resets on each incoming message for the inactivity trigger. Message count checked against `memory.message_count` on each persist. Never blocks the response path.
+**Summarization trigger (implemented):**
+
+- **Conversation-scoped:** compare `COUNT(messages)` for the **current** `conversation_id` to **`conversations.memory_checkpoint_message_count`** (default `0`).
+- When **`current_count - checkpoint >= 12`** (middle of the playbook’s 10–15 window), summarization **may** run after the chat response completes.
+- **Inactivity (5–10 minutes)** is **not implemented**; documented here as explicitly deferred.
+
+**Checkpoint writeback:** After a **successful** Haiku summarization for **both** Marie and Roy, all four `memory` rows are upserted (content + `message_count` set to the current conversation message count for bookkeeping), and **`conversations.memory_checkpoint_message_count`** is updated to that same count. If either agent’s summarization fails, **no** checkpoint advance (no partial write).
+
+**Execution:** Summarization is **async** (`scheduleMemorySummarization` after `POST /api/chat` finishes streaming). It **never blocks** the user-visible response. Failures are logged; chat is unaffected.
 
 **Summarization prompt (Haiku):**
 ```
@@ -446,15 +451,38 @@ User selects file
 ```
 User message (+ optional uploadId)
   → Router (Haiku classify)
-  → Memory Manager (read blocks from DB)
+  → Memory read (per agent about to be called)
   → [If uploadId] retrieve parsed_content
   → Build system prompt(s)
   → Build message with file content injected if present
-  → Call primary agent → stream response
-  → [If BOTH] call secondary with primary response injected → stream
-  → Persist all messages to DB
-  → [Async] check memory trigger → summarize if threshold met
+  → Call primary agent → stream response to client (NDJSON)
+  → Persist primary assistant message after stream completes
+  → [If BOTH] call secondary with deferral (non-streamed), persist secondary
+  → Stream completion payload to client
+  → [Async] memory summarization if conversation threshold met
 ```
+
+### Streaming transport (`POST /api/chat`)
+
+- Response **`Content-Type: application/x-ndjson`**: newline-delimited JSON objects.
+- **Primary agent only is streamed** (token deltas). **Secondary agent** (deferral) is **not** streamed; its text is returned in a single event after the primary is complete.
+
+**Event types (in order of a successful turn):**
+
+| Type | Purpose |
+|------|---------|
+| `start` | `conversationId`, `conversationTitle`, `route`, `streamingRole`, `messages` (thread after user message, before streamed assistant) |
+| `delta` | `{ "text": "<chunk>" }` — append to the streaming assistant bubble |
+| `primary_saved` | Full DTO for the persisted primary assistant message |
+| `secondary_saved` | Present only for BOTH routes; full DTO for Roy or Marie second |
+| `done` | Final `conversationId`, `conversationTitle`, full `messages` array |
+| `error` | Error message string (stream or server failure) |
+
+Router or JSON errors **before** streaming may return plain JSON with HTTP 4xx/5xx (not NDJSON).
+
+### Optimistic UI (client)
+
+On send, the client **immediately** appends an optimistic **user** row and a placeholder **assistant** row (`__streaming__`), then opens the NDJSON stream. The first `start` event replaces optimistic state with server thread + streaming role. **No Vercel AI SDK** — explicit `fetch` + `ReadableStream` reader.
 
 ---
 
@@ -462,35 +490,40 @@ User message (+ optional uploadId)
 
 ```
 POST   /api/chat
-       body: { conversationId, message, uploadId? }
+       body: { conversationId?, message }
+       response: NDJSON stream (see §12) on success; JSON { error } on early failure
 
 POST   /api/upload
        body: multipart/form-data { conversationId, file }
        returns: { uploadId, filename, characterCount }
 
 POST   /api/conversation
-       returns: { id, title }
+       creates a new conversation row; returns { conversationId, title }
+       used by “New Conversation” — no thread list or switching UI at MVP
+
+GET    /api/conversation/latest
+       returns latest conversation + messages (initial load)
 
 GET    /api/conversation/:id/messages
 
 GET    /api/conversation/:id/uploads
-
-POST   /api/memory/summarize
-       body: { conversationId, agent }
 ```
+
+**Conversation UX (MVP):** “New Conversation” creates a **new** `conversations` row, clears client message state, and sets the active id from the POST response. **No** multi-thread list, **no** switching threads in UI, **no** title editing.
+
+`POST /api/memory/summarize` — **not implemented** as a standalone route; summarization is invoked from the chat handler when the threshold is met.
 
 ---
 
 ## 14. Frontend
 
-- Next.js 14 App Router + Tailwind + Vercel AI SDK
-- React Native / Expo for mobile
+- Next.js 14 App Router + Tailwind (no Vercel AI SDK in current implementation)
 - Agent name label is primary identity signal — always present
 - Color is enhancement only — system must be legible in monochrome
-- Marie: cool (slate/blue) | Roy: warm (amber/gold)
-- File picker attached to input — one file per message at MVP
-- Sequential streaming — primary first, secondary after
-- Mobile: expo-document-picker + expo-image-picker
+- Marie: cool (slate) | Roy: warm (amber)
+- Optimistic user message + streaming placeholder before server round-trip completes (see §12)
+- Primary response streams; secondary appears after primary when BOTH
+- File picker / mobile Expo: planned; not required for current web MVP scope in this doc
 
 ---
 
@@ -528,20 +561,19 @@ cookies: {
 
 ## 16. API Route Protection
 
-All routes protected via NextAuth middleware. Unauthenticated requests receive 401 before the route handler runs.
+Protected routes use **`getToken`** from `next-auth/jwt` in `middleware.ts`. Unauthenticated requests receive **401** JSON before the route handler runs.
 
 ```typescript
-// middleware.ts
-export { default } from 'next-auth/middleware'
-
+// middleware.ts — pattern; see repo for exact matcher
 export const config = {
   matcher: [
-    '/api/chat',
-    '/api/upload',
-    '/api/conversation/:path*',
-    '/api/memory/:path*'
-  ]
-}
+    "/api/chat",
+    "/api/upload",
+    "/api/conversation",
+    "/api/conversation/:path*",
+    "/api/memory/:path*",
+  ],
+};
 ```
 
 Do not rely on client-side guards. The middleware is the enforcement layer.
@@ -550,14 +582,23 @@ Do not rely on client-side guards. The middleware is the enforcement layer.
 
 ## 17. Environment Variables
 
-All secrets in Vercel environment variables. None touch the codebase.
+All secrets in deployment environment variables (e.g. Vercel). None committed to the repo.
 
 ```
-ANTHROPIC_API_KEY    — Claude API
-OPENAI_API_KEY       — GPT API
+ANTHROPIC_API_KEY    — Claude (Marie + summarization + router)
+OPENAI_API_KEY       — OpenAI (Roy)
 DATABASE_URL         — Neon Postgres connection string
 NEXTAUTH_SECRET      — JWT signing key (openssl rand -base64 32)
 HASHED_PASSWORD      — bcrypt hash of login password
+```
+
+**Optional overrides (defaults in code if unset):**
+
+```
+ANTHROPIC_MODEL           — Marie main model (default claude-sonnet-4-20250514)
+ANTHROPIC_ROUTER_MODEL   — Haiku router (default claude-haiku-4-5)
+ANTHROPIC_MEMORY_MODEL   — Haiku summarizer (defaults to router model)
+OPENAI_MODEL              — Roy (default gpt-4.1)
 ```
 
 - Scoped to Production only for API keys
@@ -629,7 +670,7 @@ Mobile: Expo Go for development. EAS Build for native binary when ready.
 [ ] All /api routes in NextAuth middleware matcher
 [ ] /api/upload included in matcher
 [ ] Neon SSL enabled on connection
-[ ] Dedicated API keys for Les Cerveaux (not shared with Clarion)
+[ ] Dedicated API keys for Les Cerveaux (not shared with other apps)
 [ ] Spend limits set on Anthropic and OpenAI consoles
 [ ] file-type package used for magic byte validation
 [ ] 10MB size limit enforced server-side
@@ -647,7 +688,7 @@ Mobile: Expo Go for development. EAS Build for native binary when ready.
 
 | Risk | Mitigation |
 |------|------------|
-| Dispatcher feel instead of dialogue | BOTH is default. Sequential deferral flow. |
+| Dispatcher feel instead of dialogue | Default single-agent routes; BOTH only when classifier chooses PRIMARY. Sequential deferral when BOTH. |
 | Identity drift | Guardrail in every system prompt. Non-negotiable. |
 | Agent convergence | Secondary explicitly prompted not to duplicate primary. |
 | Flat identity (spec-sheet voice) | Full identity specifications in §7 and §8. |
@@ -679,8 +720,8 @@ Mobile: Expo Go for development. EAS Build for native binary when ready.
 | 10 | Image upload + vision integration | |
 | 11 | Memory read — inject into prompts | |
 | 12 | Memory write — trigger-based summarization | **Ship v1 here** |
-| 13 | Streaming responses | |
-| 14 | Thread management | |
+| 13 | Streaming responses (NDJSON primary) | Done |
+| 14 | Thread management | Not in current UI — single latest + new conversation only |
 | 15 | Mobile — Expo | |
 
 ---
@@ -704,7 +745,8 @@ Mobile: Expo Go for development. EAS Build for native binary when ready.
 | v3 | File ingestion added. Session-scoped at MVP. uploads table. Text and image paths. Context injection strategy. |
 | v4 | Full identity specifications for Marie and Roy. Identity written by each agent. |
 | v5 | Security playbook merged. Auth, API protection, env vars, DB security, file upload security, dependency management, pre-launch checklist all folded in. Single deliverable document. |
+| v6 | Sync with implementation: routing (PRIMARY rare), Joshua context generalized, NDJSON streaming + optimistic UI, new conversation API, conversation-scoped memory checkpoint, Roy GPT-4.1 defaults, response calibration, env overrides, middleware JWT pattern. |
 
 ---
 
-*This document is implementation-ready. Hand to Cursor at step 1.*
+*This document describes the current system as implemented. Update when behavior changes.*
