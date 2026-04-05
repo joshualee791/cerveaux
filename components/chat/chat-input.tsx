@@ -2,15 +2,21 @@
 
 import { FormEvent, useState } from "react";
 
-/**
- * Shell only — submit does not call APIs (later phases).
- */
-export function ChatInput() {
+type Props = {
+  onSend: (text: string) => Promise<void>;
+  disabled?: boolean;
+  placeholder?: string;
+};
+
+export function ChatInput({ onSend, disabled, placeholder }: Props) {
   const [value, setValue] = useState("");
 
-  function onSubmit(e: FormEvent<HTMLFormElement>) {
+  async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    // Intentionally no-op until chat API exists.
+    const t = value.trim();
+    if (!t || disabled) return;
+    setValue("");
+    await onSend(t);
   }
 
   return (
@@ -25,12 +31,14 @@ export function ChatInput() {
           rows={2}
           value={value}
           onChange={(e) => setValue(e.target.value)}
-          placeholder="Message (not sent yet)"
-          className="min-h-[2.5rem] flex-1 resize-y rounded border border-neutral-300 px-3 py-2 text-sm text-neutral-900 placeholder:text-neutral-400"
+          placeholder={placeholder ?? "Message…"}
+          disabled={disabled}
+          className="min-h-[2.5rem] flex-1 resize-y rounded border border-neutral-300 px-3 py-2 text-sm text-neutral-900 placeholder:text-neutral-400 disabled:opacity-60"
         />
         <button
           type="submit"
-          className="self-end rounded border border-neutral-400 bg-neutral-100 px-3 py-2 text-sm font-medium text-neutral-800 hover:bg-neutral-200"
+          disabled={disabled || !value.trim()}
+          className="self-end rounded border border-neutral-400 bg-neutral-100 px-3 py-2 text-sm font-medium text-neutral-800 hover:bg-neutral-200 disabled:opacity-50"
         >
           Send
         </button>
