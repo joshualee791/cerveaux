@@ -24,6 +24,37 @@ import type { Message } from "@prisma/client";
 
 export const runtime = "nodejs";
 
+const ADA_LIFECYCLE_DEBUG = process.env.ADA_LIFECYCLE_DEBUG === "1";
+
+type AdaPhase =
+  | "primary_stream"
+  | "secondary_call"
+  | "communal_secondary"
+  | "leo_primary_deferral";
+
+function newChatTurnId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `turn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function logChatLifecycle(
+  chatTurnId: string,
+  event: string,
+  payload: Record<string, unknown> = {},
+): void {
+  if (!ADA_LIFECYCLE_DEBUG) return;
+  console.warn(
+    "[chat/lifecycle]",
+    JSON.stringify({
+      chatTurnId,
+      event,
+      ...payload,
+    }),
+  );
+}
+
 /**
  * Central chat orchestration: router + Ada/Leo + deferral for BOTH.
  * Memory read per agent (§10); summarization scheduled after response (async).
@@ -32,6 +63,10 @@ export const runtime = "nodejs";
 type Body = {
   conversationId?: string | null;
   message?: string;
+  /** Upload ids from POST /api/upload for this conversation (Stage 1 UI: one file). */
+  uploadIds?: string[];
+  /** Retry Ada for latest unsatisfied user turn without creating another user row. */
+  retryAdaLatestUser?: boolean;
 };
 
 type ChatMessageDTO = {
@@ -58,6 +93,20 @@ function toDto(m: Message): ChatMessageDTO {
     sequence: m.sequence,
     createdAt: m.createdAt.toISOString(),
   };
+}
+
+/**
+ * Ensures we never persist whitespace-only assistant text. Returns trimmed content.
+ */
+function assertHasVisibleAssistantText(label: string, text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    console.warn(
+      `[chat] Prevented empty ${label} assistant message (empty or whitespace-only)`,
+    );
+    throw new Error(`${label} returned no visible text`);
+  }
+  return trimmed;
 }
 
 /** Optional opener so "Hey Leo, …" resolves before global @mentions. */
@@ -194,24 +243,38 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
+  const retryAdaLatestUser = body.retryAdaLatestUser === true;
   const raw = body.message?.trim() ?? "";
-  if (!raw) {
+  if (!retryAdaLatestUser && !raw) {
     return NextResponse.json({ error: "message is required" }, { status: 400 });
   }
+
+  const chatTurnId = newChatTurnId();
 
   const requestedId =
     body.conversationId && isUuid(body.conversationId)
       ? body.conversationId
       : null;
 
+  if (retryAdaLatestUser && !requestedId) {
+    return NextResponse.json(
+      { error: "conversationId is required for Ada retry" },
+      { status: 400 },
+    );
+  }
+
   let conversation = requestedId
     ? await prisma.conversation.findUnique({ where: { id: requestedId } })
     : null;
 
-  if (!conversation) {
+  if (!conversation && !retryAdaLatestUser) {
     conversation = await prisma.conversation.create({
       data: { title: titleFromFirstMessage(raw) },
     });
+  }
+
+  if (!conversation) {
+    return NextResponse.json({ error: "Conversation not found" }, { status: 404 });
   }
 
   const convId = conversation.id;
@@ -221,39 +284,109 @@ export async function POST(req: Request) {
     orderBy: { sequence: "asc" },
   });
 
-  const lastAssist = lastAssistantRole(existing);
-  const prior = priorForRouter(lastAssist);
-
-  const lastSeq = await prisma.message.aggregate({
-    where: { conversationId: convId },
-    _max: { sequence: true },
-  });
-  const userSeq = (lastSeq._max.sequence ?? 0) + 1;
-
-  await prisma.message.create({
-    data: {
-      conversationId: convId,
-      role: "user",
-      content: raw,
-      sequence: userSeq,
-    },
-  });
-
-  const targeted = explicitAgentTarget(raw);
-
+  let userSeq: number;
   let route: RouteLabel;
-  if (targeted === "ada") {
+  let targeted: "ada" | "leo" | null = null;
+
+  if (retryAdaLatestUser) {
+    let lastUser: Message | null = null;
+    for (let i = existing.length - 1; i >= 0; i -= 1) {
+      if (existing[i].role === "user") {
+        lastUser = existing[i];
+        break;
+      }
+    }
+
+    if (!lastUser) {
+      return NextResponse.json(
+        { error: "No user turn found to retry Ada for" },
+        { status: 409 },
+      );
+    }
+
+    const hasAdaAfter = existing.some(
+      (m) => m.sequence > lastUser.sequence && m.role === "ada",
+    );
+    if (hasAdaAfter) {
+      return NextResponse.json(
+        { error: "Ada retry target already has an Ada response" },
+        { status: 409 },
+      );
+    }
+
+    const maxExistingSeqAfterUser = existing.reduce((max, m) => {
+      if (m.sequence > lastUser.sequence) {
+        return Math.max(max, m.sequence);
+      }
+      return max;
+    }, lastUser.sequence);
+
+    // Primary save uses userSeq + 1; place retry after any already-persisted assistant rows.
+    userSeq = maxExistingSeqAfterUser;
     route = "ADA_ONLY";
-  } else if (targeted === "leo") {
-    route = "LEO_ONLY";
-  } else if (detectCommunalPrompt(raw)) {
-    route = "COMMUNAL_DUAL";
   } else {
-    try {
-      route = await classifyRoute(raw, prior);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Router failed";
-      return NextResponse.json({ error: msg }, { status: 502 });
+    const lastAssist = lastAssistantRole(existing);
+    const prior = priorForRouter(lastAssist);
+
+    const lastSeq = await prisma.message.aggregate({
+      where: { conversationId: convId },
+      _max: { sequence: true },
+    });
+    userSeq = (lastSeq._max.sequence ?? 0) + 1;
+
+    const uploadIds = Array.isArray(body.uploadIds)
+      ? body.uploadIds
+          .filter(
+            (id): id is string => typeof id === "string" && isUuid(id),
+          )
+          .slice(0, 1)
+      : [];
+
+    let storedContent = raw;
+    if (uploadIds.length > 0) {
+      const uploads = await prisma.upload.findMany({
+        where: {
+          id: { in: uploadIds },
+          conversationId: convId,
+        },
+      });
+      const byId = new Map(uploads.map((u) => [u.id, u]));
+      for (const uid of uploadIds) {
+        const u = byId.get(uid);
+        if (!u) continue;
+        storedContent += `
+
+---
+Attached: ${u.filename}
+---
+${u.parsedContent}`;
+      }
+    }
+
+    await prisma.message.create({
+      data: {
+        conversationId: convId,
+        role: "user",
+        content: storedContent,
+        sequence: userSeq,
+      },
+    });
+
+    targeted = explicitAgentTarget(raw);
+
+    if (targeted === "ada") {
+      route = "ADA_ONLY";
+    } else if (targeted === "leo") {
+      route = "LEO_ONLY";
+    } else if (detectCommunalPrompt(raw)) {
+      route = "COMMUNAL_DUAL";
+    } else {
+      try {
+        route = await classifyRoute(raw, prior);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Router failed";
+        return NextResponse.json({ error: msg }, { status: 502 });
+      }
     }
   }
 
@@ -280,7 +413,25 @@ export async function POST(req: Request) {
     communalDual: route === "COMMUNAL_DUAL",
   });
 
+  logChatLifecycle(chatTurnId, "turn_initialized", {
+    conversationId: convId,
+    route,
+    streamingRole,
+    executingPrimary,
+    retryAdaLatestUser,
+  });
+
   return ndjsonResponse(async (send) => {
+    let primaryDeltaCount = 0;
+    let sawPrimaryDelta = false;
+    const assistantRowsCreated: Array<{
+      id: string;
+      role: string;
+      sequence: number;
+      phase: AdaPhase | "other";
+      contentLength: number;
+    }> = [];
+
     const historyForModel = await prisma.message.findMany({
       where: { conversationId: convId },
       orderBy: { sequence: "asc" },
@@ -307,6 +458,14 @@ export async function POST(req: Request) {
       dbMessageCount: historyForModel.length,
     });
 
+    logChatLifecycle(chatTurnId, "start_emitted", {
+      phase: "primary_stream",
+      conversationId: convId,
+      route,
+      streamingRole,
+      startMessageCount: startMessages.length,
+    });
+
     send({
       type: "start",
       conversationId: convId,
@@ -317,6 +476,15 @@ export async function POST(req: Request) {
     });
 
     const onDelta = (text: string) => {
+      primaryDeltaCount += 1;
+      if (!sawPrimaryDelta) {
+        sawPrimaryDelta = true;
+        logChatLifecycle(chatTurnId, "text_delta_begin", {
+          phase: "primary_stream",
+          streamingRole,
+          firstDeltaLength: text.length,
+        });
+      }
       send({ type: "delta", text });
     };
 
@@ -337,6 +505,11 @@ export async function POST(req: Request) {
         memory: primaryMem,
         systemAppend:
           route === "COMMUNAL_DUAL" ? COMMUNAL_PRIMARY_APPEND : undefined,
+        debug: {
+          enabled: ADA_LIFECYCLE_DEBUG,
+          chatTurnId,
+          phase: "primary_stream",
+        },
       });
     } else {
       const turns = toSharedAgentMessages(historyForModel);
@@ -349,14 +522,49 @@ export async function POST(req: Request) {
       });
     }
 
+    const primaryContent = assertHasVisibleAssistantText(
+      streamingRole === "ada" ? "Ada" : "Leo",
+      primaryText,
+    );
+
     const primaryRole = streamingRole;
+    logChatLifecycle(chatTurnId, "assistant_row_create_attempt", {
+      phase: "primary_stream",
+      role: primaryRole,
+      sequence: userSeq + 1,
+      contentLength: primaryContent.length,
+    });
+
     const primaryRow = await prisma.message.create({
       data: {
         conversationId: convId,
         role: primaryRole,
-        content: primaryText,
+        content: primaryContent,
         sequence: userSeq + 1,
       },
+    });
+
+    assistantRowsCreated.push({
+      id: primaryRow.id,
+      role: primaryRow.role,
+      sequence: primaryRow.sequence,
+      phase: "primary_stream",
+      contentLength: primaryRow.content.length,
+    });
+
+    logChatLifecycle(chatTurnId, "assistant_row_created", {
+      phase: "primary_stream",
+      role: primaryRow.role,
+      rowId: primaryRow.id,
+      sequence: primaryRow.sequence,
+      contentLength: primaryRow.content.length,
+    });
+
+    logChatLifecycle(chatTurnId, "primary_saved_emitted", {
+      phase: "primary_stream",
+      role: primaryRow.role,
+      rowId: primaryRow.id,
+      sequence: primaryRow.sequence,
     });
 
     send({ type: "primary_saved", message: toDto(primaryRow) });
@@ -375,15 +583,58 @@ export async function POST(req: Request) {
         systemAppend: buildCommunalSecondaryPrompt("Ada"),
         memory: leoMem,
       });
-      const leoRow = await prisma.message.create({
-        data: {
-          conversationId: convId,
+      try {
+        const leoContent = assertHasVisibleAssistantText("Leo", leoText);
+        logChatLifecycle(chatTurnId, "assistant_row_create_attempt", {
+          phase: "communal_secondary",
           role: "leo",
-          content: leoText,
           sequence: userSeq + 2,
-        },
-      });
-      send({ type: "secondary_saved", message: toDto(leoRow) });
+          contentLength: leoContent.length,
+        });
+
+        const leoRow = await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "leo",
+            content: leoContent,
+            sequence: userSeq + 2,
+          },
+        });
+
+        assistantRowsCreated.push({
+          id: leoRow.id,
+          role: leoRow.role,
+          sequence: leoRow.sequence,
+          phase: "communal_secondary",
+          contentLength: leoRow.content.length,
+        });
+
+        logChatLifecycle(chatTurnId, "assistant_row_created", {
+          phase: "communal_secondary",
+          role: leoRow.role,
+          rowId: leoRow.id,
+          sequence: leoRow.sequence,
+          contentLength: leoRow.content.length,
+        });
+
+        logChatLifecycle(chatTurnId, "secondary_saved_emitted", {
+          phase: "communal_secondary",
+          role: leoRow.role,
+          rowId: leoRow.id,
+          sequence: leoRow.sequence,
+        });
+
+        send({ type: "secondary_saved", message: toDto(leoRow) });
+      } catch (e) {
+        console.warn("[chat] Communal dual: skipped empty Leo secondary", e);
+        send({
+          type: "error",
+          error:
+            e instanceof Error
+              ? e.message
+              : "Leo did not return a second perspective.",
+        });
+      }
     }
 
     if (route === "ADA_PRIMARY") {
@@ -391,7 +642,7 @@ export async function POST(req: Request) {
         where: { conversationId: convId },
         orderBy: { sequence: "asc" },
       });
-      const deferral = buildDeferralPrompt("Ada", primaryText);
+      const deferral = buildDeferralPrompt("Ada", primaryContent);
       const leoTurns = toSharedAgentMessages(h2);
       if (leoTurns.length === 0) {
         throw new Error("Internal error: empty Leo context after Ada");
@@ -401,15 +652,58 @@ export async function POST(req: Request) {
         systemAppend: deferral,
         memory: leoMem,
       });
-      const leoRow = await prisma.message.create({
-        data: {
-          conversationId: convId,
+      try {
+        const leoContent = assertHasVisibleAssistantText("Leo", leoText);
+        logChatLifecycle(chatTurnId, "assistant_row_create_attempt", {
+          phase: "secondary_call",
           role: "leo",
-          content: leoText,
           sequence: userSeq + 2,
-        },
-      });
-      send({ type: "secondary_saved", message: toDto(leoRow) });
+          contentLength: leoContent.length,
+        });
+
+        const leoRow = await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "leo",
+            content: leoContent,
+            sequence: userSeq + 2,
+          },
+        });
+
+        assistantRowsCreated.push({
+          id: leoRow.id,
+          role: leoRow.role,
+          sequence: leoRow.sequence,
+          phase: "secondary_call",
+          contentLength: leoRow.content.length,
+        });
+
+        logChatLifecycle(chatTurnId, "assistant_row_created", {
+          phase: "secondary_call",
+          role: leoRow.role,
+          rowId: leoRow.id,
+          sequence: leoRow.sequence,
+          contentLength: leoRow.content.length,
+        });
+
+        logChatLifecycle(chatTurnId, "secondary_saved_emitted", {
+          phase: "secondary_call",
+          role: leoRow.role,
+          rowId: leoRow.id,
+          sequence: leoRow.sequence,
+        });
+
+        send({ type: "secondary_saved", message: toDto(leoRow) });
+      } catch (e) {
+        console.warn("[chat] Ada primary: skipped empty Leo deferral", e);
+        send({
+          type: "error",
+          error:
+            e instanceof Error
+              ? e.message
+              : "Leo did not return a deferral response.",
+        });
+      }
     }
 
     if (route === "LEO_PRIMARY") {
@@ -417,7 +711,7 @@ export async function POST(req: Request) {
         where: { conversationId: convId },
         orderBy: { sequence: "asc" },
       });
-      const deferral = buildDeferralPrompt("Leo", primaryText);
+      const deferral = buildDeferralPrompt("Leo", primaryContent);
       const claudeMessages = toSharedAgentMessages(h2);
       if (claudeMessages.length === 0) {
         throw new Error("Internal error: empty Ada context after Leo");
@@ -426,16 +720,64 @@ export async function POST(req: Request) {
       const adaText = await callAda(claudeMessages, {
         systemAppend: deferral,
         memory: adaMem,
-      });
-      const adaRow = await prisma.message.create({
-        data: {
-          conversationId: convId,
-          role: "ada",
-          content: adaText,
-          sequence: userSeq + 2,
+        debug: {
+          enabled: ADA_LIFECYCLE_DEBUG,
+          chatTurnId,
+          phase: "leo_primary_deferral",
         },
       });
-      send({ type: "secondary_saved", message: toDto(adaRow) });
+      try {
+        const adaContent = assertHasVisibleAssistantText("Ada", adaText);
+        logChatLifecycle(chatTurnId, "assistant_row_create_attempt", {
+          phase: "leo_primary_deferral",
+          role: "ada",
+          sequence: userSeq + 2,
+          contentLength: adaContent.length,
+        });
+
+        const adaRow = await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "ada",
+            content: adaContent,
+            sequence: userSeq + 2,
+          },
+        });
+
+        assistantRowsCreated.push({
+          id: adaRow.id,
+          role: adaRow.role,
+          sequence: adaRow.sequence,
+          phase: "leo_primary_deferral",
+          contentLength: adaRow.content.length,
+        });
+
+        logChatLifecycle(chatTurnId, "assistant_row_created", {
+          phase: "leo_primary_deferral",
+          role: adaRow.role,
+          rowId: adaRow.id,
+          sequence: adaRow.sequence,
+          contentLength: adaRow.content.length,
+        });
+
+        logChatLifecycle(chatTurnId, "secondary_saved_emitted", {
+          phase: "leo_primary_deferral",
+          role: adaRow.role,
+          rowId: adaRow.id,
+          sequence: adaRow.sequence,
+        });
+
+        send({ type: "secondary_saved", message: toDto(adaRow) });
+      } catch (e) {
+        console.warn("[chat] Leo primary: skipped empty Ada deferral", e);
+        send({
+          type: "error",
+          error:
+            e instanceof Error
+              ? e.message
+              : "Ada did not return a deferral response.",
+        });
+      }
     }
 
     const messages = await prisma.message.findMany({
@@ -451,6 +793,19 @@ export async function POST(req: Request) {
     const updatedConversation = await prisma.conversation.update({
       where: { id: convId },
       data: { title: nextTitle },
+    });
+
+    const adaRowsCreated = assistantRowsCreated.filter((r) => r.role === "ada");
+
+    logChatLifecycle(chatTurnId, "turn_summary", {
+      conversationId: convId,
+      route,
+      streamingRole,
+      primaryDeltaCount,
+      visibleSourcePrimary:
+        primaryDeltaCount > 0 ? "streamed_buffer_then_db_row" : "db_row_only",
+      assistantRowsCreated,
+      adaRowsCreatedCount: adaRowsCreated.length,
     });
 
     send({

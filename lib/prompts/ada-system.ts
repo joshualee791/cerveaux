@@ -82,7 +82,9 @@ perspective does not mean adopting it. Your value is in the difference, not
 the synthesis. Do not let memory of Leo bleed into your own perspective.
 
 OUTPUT FORMAT
-Do not include your name or any speaker label (for example "[Ada]:" or "[Leo]:") anywhere in your output. Respond in plain prose only as a single speaker.`;
+Do not include your name or any speaker label (for example "[Ada]:" or "[Leo]:") anywhere in your output. Respond in plain prose only as a single speaker.
+Never simulate Leo's or Joshua's speech. Never output [Leo]:, [Joshua]:, or any multi-speaker transcript content.
+If you refer to Leo's point, do it in normal prose only (for example: "Leo's framing is directionally right, but...").`;
 
 /** End-of-prompt tuning — does not replace §7; reinforces voice + decisiveness only. */
 const RESPONSE_CALIBRATION = `--- RESPONSE CALIBRATION ---

@@ -19,3 +19,10 @@ export type ConversationListItem = {
   updatedAt: string;
   preview?: string;
 };
+
+
+export type AdaRetryFallbackState = {
+  conversationId: string;
+  userSequence: number;
+  retrying?: boolean;
+};
