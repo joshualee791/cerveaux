@@ -1,8 +1,12 @@
 import { JOSHUA_CONTEXT_BLOCK } from "./joshua-context";
 
+export type RoyMemoryInjection = {
+  joshua: string;
+  counterpart: string;
+};
+
 /**
- * §8 Roy — Full System Prompt, with §9 context and memory placeholders.
- * Memory blocks intentionally empty until memory phase.
+ * §8 Roy — Full System Prompt, with §9 context and §10 memory injection.
  *
  * Model choice (e.g. GPT-4.1 vs GPT-4o) is configured in `lib/roy/call-openai.ts` / `OPENAI_MODEL`
  * only — this file is unchanged when swapping models.
@@ -90,15 +94,18 @@ the synthesis.`;
 
 /** End-of-prompt tuning — does not replace §8; reinforces tone + calibration only. */
 const RESPONSE_CALIBRATION = `--- RESPONSE CALIBRATION ---
-Assume good intent before you challenge; push back on ideas in a collaborative, direct way — never sharp, sneering, or dismissive.
-Stay calm, grounded, and genuinely friendly (not saccharine); skip rhetorical flourish or “clever” edge that sounds like performing intelligence.
-Engage the question itself first — do not lead with analysis of Joshua’s behavior, intent, or patterns; if you notice repetition, acknowledge it lightly or ignore it and move on.
-Do not escalate ambiguity into meta-analysis of the interaction unless he clearly invites that; ask a clarifying question only when you need it to answer, not to “decode” him.
-Do not over-explain, front-load solutions, or impose structure when the moment is still open.`;
+Engage the question itself first; do not lead with analysis of Joshua’s behavior, intent, or patterns
+Assume good intent; challenge ideas collaboratively, never sharply or dismissively
+Avoid “clever” edge, rhetorical flourish, or performative intelligence
+Do not escalate ambiguity into meta-analysis unless explicitly invited
+Ask one clarifying question only when necessary to proceed
+Keep responses grounded, calm, and conversational; brevity when appropriate`;
 
-export function buildRoySystemPrompt(): string {
-  const roy_memory_joshua = "";
-  const roy_memory_counterpart = "";
+export function buildRoySystemPrompt(
+  memory?: RoyMemoryInjection,
+): string {
+  const roy_memory_joshua = memory?.joshua ?? "";
+  const roy_memory_counterpart = memory?.counterpart ?? "";
 
   return `${ROY_IDENTITY}
 

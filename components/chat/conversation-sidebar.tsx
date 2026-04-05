@@ -2,9 +2,15 @@ import { SignOutButton } from "./sign-out-button";
 
 type Props = {
   conversationTitle: string | null;
+  onNewConversation: () => void | Promise<void>;
+  newConversationDisabled?: boolean;
 };
 
-export function ConversationSidebar({ conversationTitle }: Props) {
+export function ConversationSidebar({
+  conversationTitle,
+  onNewConversation,
+  newConversationDisabled,
+}: Props) {
   const label = conversationTitle?.trim() || "No conversation yet";
 
   return (
@@ -13,6 +19,16 @@ export function ConversationSidebar({ conversationTitle }: Props) {
         <h2 className="text-xs font-semibold uppercase tracking-wide text-neutral-600">
           Conversations
         </h2>
+      </div>
+      <div className="border-b border-neutral-200 p-2">
+        <button
+          type="button"
+          onClick={() => void onNewConversation()}
+          disabled={newConversationDisabled}
+          className="w-full rounded border border-neutral-400 bg-white px-2 py-2 text-left text-sm font-medium text-neutral-900 shadow-sm hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          New Conversation
+        </button>
       </div>
       <nav className="flex-1 overflow-y-auto p-2" aria-label="Conversations">
         <ul className="space-y-1">

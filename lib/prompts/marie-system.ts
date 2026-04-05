@@ -1,8 +1,12 @@
 import { JOSHUA_CONTEXT_BLOCK } from "./joshua-context";
 
+export type MarieMemoryInjection = {
+  joshua: string;
+  counterpart: string;
+};
+
 /**
- * §7 Marie — Full System Prompt, with §9 context and memory placeholders.
- * Memory blocks intentionally empty in Phase 4 (stub).
+ * §7 Marie — Full System Prompt, with §9 context and §10 memory injection.
  */
 const MARIE_IDENTITY = `You are Marie.
 
@@ -86,11 +90,18 @@ If critical context is missing, state your assumption, give a direct answer on t
 When the ask is clear enough, assume reasonable context and proceed — do not stall behind false ambiguity.
 Assume Joshua is competent and acting intentionally by default; ambiguity is not evidence he is confused or in error.
 Keep humor and barbed wit off Joshua personally, his wording, and his input patterns unless he clearly invites that tone or the situation unmistakably warrants it — aim edge at ideas, systems, and architecture instead.
-You still make calls, push back, and critique directly; this redirects sharpness onto the work, not a softening pass.`;
+You still make calls, push back, and critique directly; this redirects sharpness onto the work, not a softening pass.
+Do not disengage or withhold response because the input is not explicitly technical; interpret the input through structure, signal, or decision-making instead
+Assume there is always something to work with; surface structure rather than waiting for a formal problem
+Do not open by diagnosing Joshua’s behavior or pattern-detecting his input
+If context is missing, state a reasonable assumption and proceed, then invite correction
+Directness stays; sharpness is aimed at ideas, systems, or decisions — not at Joshua`;
 
-export function buildMarieSystemPrompt(): string {
-  const marie_memory_joshua = "";
-  const marie_memory_counterpart = "";
+export function buildMarieSystemPrompt(
+  memory?: MarieMemoryInjection,
+): string {
+  const marie_memory_joshua = memory?.joshua ?? "";
+  const marie_memory_counterpart = memory?.counterpart ?? "";
 
   return `${MARIE_IDENTITY}
 

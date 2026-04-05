@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { buildDeferralPrompt } from "@/lib/deferral";
-import { callMarie } from "@/lib/marie/call-claude";
-import { callRoy } from "@/lib/roy/call-openai";
+import { callMarie, streamMarie } from "@/lib/marie/call-claude";
+import { callRoy, streamRoy } from "@/lib/roy/call-openai";
 import {
   isUuid,
   lastAssistantRole,
@@ -12,19 +12,29 @@ import {
   toOpenAiTurns,
 } from "@/lib/chat-helpers";
 import { classifyRoute } from "@/lib/router/classify";
+import { getAgentMemory } from "@/lib/memory/read";
+import { scheduleMemorySummarization } from "@/lib/memory/summarize";
 import { prisma } from "@/lib/prisma";
+import type { Message } from "@prisma/client";
 
 export const runtime = "nodejs";
 
 /**
- * Central chat orchestration (Phase 6): router (Haiku) + Marie/Roy + deferral for BOTH.
- * Canonical thread in `messages`; LLM inputs use role-filtered projections; deferral injects
- * primary text via system append only for the secondary call (§5).
+ * Central chat orchestration: router + Marie/Roy + deferral for BOTH.
+ * Memory read per agent (§10); summarization scheduled after response (async).
  */
 
 type Body = {
   conversationId?: string | null;
   message?: string;
+};
+
+type ChatMessageDTO = {
+  id: string;
+  role: string;
+  content: string;
+  sequence: number;
+  createdAt: string;
 };
 
 function priorForRouter(
@@ -33,6 +43,48 @@ function priorForRouter(
   if (role === "marie") return "Marie";
   if (role === "roy") return "Roy";
   return "none";
+}
+
+function toDto(m: Message): ChatMessageDTO {
+  return {
+    id: m.id,
+    role: m.role,
+    content: m.content,
+    sequence: m.sequence,
+    createdAt: m.createdAt.toISOString(),
+  };
+}
+
+function ndjsonResponse(
+  run: (send: (obj: Record<string, unknown>) => void) => Promise<void>,
+) {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      async start(controller) {
+        const send = (obj: Record<string, unknown>) => {
+          controller.enqueue(
+            encoder.encode(`${JSON.stringify(obj)}\n`),
+          );
+        };
+        try {
+          await run(send);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : "LLM request failed";
+          send({ type: "error", error: msg });
+        } finally {
+          controller.close();
+        }
+      },
+    }),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    },
+  );
 }
 
 export async function POST(req: Request) {
@@ -106,131 +158,121 @@ export async function POST(req: Request) {
     orderBy: { sequence: "asc" },
   });
 
-  const runMarieOnly = async () => {
-    const claudeMessages = toClaudeMessages(historyAfterUser);
-    if (claudeMessages.length === 0) {
-      throw new Error("Internal error: empty Marie context");
+  const streamingRole: "marie" | "roy" =
+    route === "MARIE_ONLY" || route === "MARIE_PRIMARY" ? "marie" : "roy";
+
+  const startMessages: ChatMessageDTO[] = historyAfterUser.map(toDto);
+
+  return ndjsonResponse(async (send) => {
+    send({
+      type: "start",
+      conversationId: convId,
+      conversationTitle: conversation.title,
+      route,
+      streamingRole,
+      messages: startMessages,
+    });
+
+    const onDelta = (text: string) => {
+      send({ type: "delta", text });
+    };
+
+    const primaryMem = await getAgentMemory(streamingRole);
+
+    let primaryText: string;
+    if (route === "MARIE_ONLY" || route === "MARIE_PRIMARY") {
+      const claudeMessages = toClaudeMessages(historyAfterUser);
+      if (claudeMessages.length === 0) {
+        throw new Error("Internal error: empty Marie context");
+      }
+      primaryText = await streamMarie(claudeMessages, {
+        onDelta,
+        memory: primaryMem,
+      });
+    } else {
+      const turns = toOpenAiTurns(historyAfterUser);
+      if (turns.length === 0) {
+        throw new Error("Internal error: empty Roy context");
+      }
+      primaryText = await streamRoy(turns, { onDelta, memory: primaryMem });
     }
-    return callMarie(claudeMessages);
-  };
 
-  const runRoyOnly = async () => {
-    const turns = toOpenAiTurns(historyAfterUser);
-    if (turns.length === 0) {
-      throw new Error("Internal error: empty Roy context");
+    const primaryRole = streamingRole;
+    const primaryRow = await prisma.message.create({
+      data: {
+        conversationId: convId,
+        role: primaryRole,
+        content: primaryText,
+        sequence: userSeq + 1,
+      },
+    });
+
+    send({ type: "primary_saved", message: toDto(primaryRow) });
+
+    if (route === "MARIE_PRIMARY") {
+      const h2 = await prisma.message.findMany({
+        where: { conversationId: convId },
+        orderBy: { sequence: "asc" },
+      });
+      const deferral = buildDeferralPrompt("Marie", primaryText);
+      const royTurns = toOpenAiTurns(h2);
+      if (royTurns.length === 0) {
+        throw new Error("Internal error: empty Roy context after Marie");
+      }
+      const royMem = await getAgentMemory("roy");
+      const royText = await callRoy(royTurns, {
+        systemAppend: deferral,
+        memory: royMem,
+      });
+      const royRow = await prisma.message.create({
+        data: {
+          conversationId: convId,
+          role: "roy",
+          content: royText,
+          sequence: userSeq + 2,
+        },
+      });
+      send({ type: "secondary_saved", message: toDto(royRow) });
     }
-    return callRoy(turns);
-  };
 
-  try {
-    switch (route) {
-      case "MARIE_ONLY": {
-        const marieText = await runMarieOnly();
-        await prisma.message.create({
-          data: {
-            conversationId: convId,
-            role: "marie",
-            content: marieText,
-            sequence: userSeq + 1,
-          },
-        });
-        break;
+    if (route === "ROY_PRIMARY") {
+      const h2 = await prisma.message.findMany({
+        where: { conversationId: convId },
+        orderBy: { sequence: "asc" },
+      });
+      const deferral = buildDeferralPrompt("Roy", primaryText);
+      const claudeMessages = toClaudeMessages(h2);
+      if (claudeMessages.length === 0) {
+        throw new Error("Internal error: empty Marie context after Roy");
       }
-      case "ROY_ONLY": {
-        const royText = await runRoyOnly();
-        await prisma.message.create({
-          data: {
-            conversationId: convId,
-            role: "roy",
-            content: royText,
-            sequence: userSeq + 1,
-          },
-        });
-        break;
-      }
-      case "MARIE_PRIMARY": {
-        const marieText = await runMarieOnly();
-        await prisma.message.create({
-          data: {
-            conversationId: convId,
-            role: "marie",
-            content: marieText,
-            sequence: userSeq + 1,
-          },
-        });
-        const h2 = await prisma.message.findMany({
-          where: { conversationId: convId },
-          orderBy: { sequence: "asc" },
-        });
-        const deferral = buildDeferralPrompt("Marie", marieText);
-        const royTurns = toOpenAiTurns(h2);
-        if (royTurns.length === 0) {
-          throw new Error("Internal error: empty Roy context after Marie");
-        }
-        const royText = await callRoy(royTurns, { systemAppend: deferral });
-        await prisma.message.create({
-          data: {
-            conversationId: convId,
-            role: "roy",
-            content: royText,
-            sequence: userSeq + 2,
-          },
-        });
-        break;
-      }
-      case "ROY_PRIMARY": {
-        const royText = await runRoyOnly();
-        await prisma.message.create({
-          data: {
-            conversationId: convId,
-            role: "roy",
-            content: royText,
-            sequence: userSeq + 1,
-          },
-        });
-        const h2 = await prisma.message.findMany({
-          where: { conversationId: convId },
-          orderBy: { sequence: "asc" },
-        });
-        const deferral = buildDeferralPrompt("Roy", royText);
-        const claudeMessages = toClaudeMessages(h2);
-        if (claudeMessages.length === 0) {
-          throw new Error("Internal error: empty Marie context after Roy");
-        }
-        const marieText = await callMarie(claudeMessages, {
-          systemAppend: deferral,
-        });
-        await prisma.message.create({
-          data: {
-            conversationId: convId,
-            role: "marie",
-            content: marieText,
-            sequence: userSeq + 2,
-          },
-        });
-        break;
-      }
+      const marieMem = await getAgentMemory("marie");
+      const marieText = await callMarie(claudeMessages, {
+        systemAppend: deferral,
+        memory: marieMem,
+      });
+      const marieRow = await prisma.message.create({
+        data: {
+          conversationId: convId,
+          role: "marie",
+          content: marieText,
+          sequence: userSeq + 2,
+        },
+      });
+      send({ type: "secondary_saved", message: toDto(marieRow) });
     }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "LLM request failed";
-    return NextResponse.json({ error: msg }, { status: 502 });
-  }
 
-  const messages = await prisma.message.findMany({
-    where: { conversationId: convId },
-    orderBy: { sequence: "asc" },
-  });
+    const messages = await prisma.message.findMany({
+      where: { conversationId: convId },
+      orderBy: { sequence: "asc" },
+    });
 
-  return NextResponse.json({
-    conversationId: convId,
-    conversationTitle: conversation.title,
-    route,
-    messages: messages.map((m) => ({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      sequence: m.sequence,
-      createdAt: m.createdAt.toISOString(),
-    })),
+    send({
+      type: "done",
+      conversationId: convId,
+      conversationTitle: conversation.title,
+      messages: messages.map(toDto),
+    });
+
+    scheduleMemorySummarization(convId);
   });
 }

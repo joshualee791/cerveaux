@@ -4,7 +4,13 @@ import type { ChatMessageDTO } from "./types";
 import type { MessageRole } from "./types";
 
 function roleForUi(role: string): MessageRole | null {
-  if (role === "user" || role === "marie" || role === "roy") return role;
+  if (
+    role === "user" ||
+    role === "marie" ||
+    role === "roy" ||
+    role === "assistant"
+  )
+    return role;
   return null;
 }
 
@@ -33,10 +39,7 @@ export function MessageThread({
           <p className="text-sm text-neutral-500">Loading…</p>
         ) : null}
         {!loading && messages.length === 0 ? (
-          <p className="text-sm text-neutral-600">
-            Send a message to start. Marie will reply using the playbook system
-            prompt (memory not injected yet).
-          </p>
+          <p className="text-sm text-neutral-600">Send a message to start.</p>
         ) : null}
         {messages.map((m) => {
           const r = roleForUi(m.role);
@@ -47,6 +50,9 @@ export function MessageThread({
               role={r}
               content={m.content}
               userName={userName}
+              isStreaming={
+                m.id === "__streaming__" || Boolean(m.streaming)
+              }
             />
           );
         })}
