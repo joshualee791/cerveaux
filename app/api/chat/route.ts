@@ -97,8 +97,21 @@ function leadingExplicitAgentTarget(t: string): "marie" | "roy" | null {
 }
 
 /**
+ * Trailing addressee: "…, Roy" / "…, Marie" / "… Roy?" at end (common in questions).
+ */
+function trailingExplicitAgentTarget(t: string): "marie" | "roy" | null {
+  const s = t.trim();
+  if (/,+\s*Roy\s*[?.!]?\s*$/i.test(s)) return "roy";
+  if (/,+\s*Marie\s*[?.!]?\s*$/i.test(s)) return "marie";
+  if (/\bRoy\s*\?\s*$/i.test(s)) return "roy";
+  if (/\bMarie\s*\?\s*$/i.test(s)) return "marie";
+  return null;
+}
+
+/**
  * Deterministic explicit addressee — overrides Haiku classification when set.
- * Leading address (incl. greeting + Marie/Roy) first; else global @marie/@roy by first occurrence.
+ * Leading address (incl. greeting + Marie/Roy) first; else trailing ", Roy" / ", Marie";
+ * else global @marie/@roy by first occurrence.
  */
 function explicitAgentTarget(raw: string): "marie" | "roy" | null {
   const t = raw.trim();
@@ -106,6 +119,9 @@ function explicitAgentTarget(raw: string): "marie" | "roy" | null {
 
   const leading = leadingExplicitAgentTarget(t);
   if (leading) return leading;
+
+  const trailing = trailingExplicitAgentTarget(t);
+  if (trailing) return trailing;
 
   const idxMarie = t.search(/@marie\b/i);
   const idxRoy = t.search(/@roy\b/i);
@@ -225,11 +241,6 @@ export async function POST(req: Request) {
     }
   }
 
-  const historyAfterUser = await prisma.message.findMany({
-    where: { conversationId: convId },
-    orderBy: { sequence: "asc" },
-  });
-
   const streamingRole: "marie" | "roy" =
     route === "MARIE_ONLY" || route === "MARIE_PRIMARY" ? "marie" : "roy";
 
@@ -246,30 +257,70 @@ export async function POST(req: Request) {
     classifierSkipped: targeted !== null,
   });
 
-  const startMessages: ChatMessageDTO[] = historyAfterUser.map(toDto);
-
   return ndjsonResponse(async (send) => {
+    const historyForModel = await prisma.message.findMany({
+      where: { conversationId: convId },
+      orderBy: { sequence: "asc" },
+    });
+
+    const lastRow = historyForModel[historyForModel.length - 1];
+    const preview =
+      lastRow?.content
+        .slice(0, 120)
+        .replace(/\s+/g, " ")
+        .trim() ?? "";
+    console.log("[history/debug]", {
+      conversationId: convId,
+      messageCount: historyForModel.length,
+      lastMessageRole: lastRow?.role ?? null,
+      lastMessageSequence: lastRow?.sequence ?? null,
+      lastMessagePreview: preview,
+    });
+
+    const startMessages: ChatMessageDTO[] = historyForModel.map(toDto);
+
+    const onlyRoute = route === "MARIE_ONLY" || route === "ROY_ONLY";
+    const crossAgentGateOpen =
+      onlyRoute &&
+      (targeted === null || targeted === streamingRole);
+
+    const refProbe = onlyRoute
+      ? detectCrossAgentReference(raw, streamingRole)
+      : null;
+
     let crossAgentAppend: string | undefined;
-    if (
-      (route === "MARIE_ONLY" || route === "ROY_ONLY") &&
-      targeted &&
-      targeted === streamingRole
-    ) {
-      const referenced = detectCrossAgentReference(raw, streamingRole);
-      if (referenced) {
-        const refWindow = recentReferencedAgentContextWindow(
-          historyAfterUser,
-          referenced,
-        );
-        crossAgentAppend = buildCrossAgentReferenceContextAppend(
-          referenced,
-          refWindow.map((m) => ({
-            sequence: m.sequence,
-            content: m.content,
-          })),
-        );
-      }
+    let refWindow: { sequence: number; content: string }[] = [];
+
+    if (crossAgentGateOpen && refProbe) {
+      const rows = recentReferencedAgentContextWindow(
+        historyForModel,
+        refProbe,
+      );
+      refWindow = rows.map((m) => ({
+        sequence: m.sequence,
+        content: m.content,
+      }));
+      crossAgentAppend = buildCrossAgentReferenceContextAppend(
+        refProbe,
+        refWindow,
+      );
     }
+
+    const appendCharLen = crossAgentAppend?.length ?? 0;
+    console.log("[cross-agent/debug]", {
+      explicitTarget:
+        targeted === null ? null : targeted === "marie" ? "MARIE" : "ROY",
+      finalRoute: route,
+      streamingRole,
+      crossAgentGateOpen,
+      referenceDetected: refProbe !== null,
+      referencedAgent:
+        refProbe === null ? null : refProbe === "marie" ? "MARIE" : "ROY",
+      referencedMessageCount: crossAgentGateOpen && refProbe ? refWindow.length : 0,
+      appendBuilt: crossAgentAppend !== undefined,
+      appendCharLength: appendCharLen,
+      appendPassedToStream: crossAgentAppend !== undefined,
+    });
 
     send({
       type: "start",
@@ -288,7 +339,7 @@ export async function POST(req: Request) {
 
     let primaryText: string;
     if (route === "MARIE_ONLY" || route === "MARIE_PRIMARY") {
-      const claudeMessages = toClaudeMessages(historyAfterUser);
+      const claudeMessages = toClaudeMessages(historyForModel);
       if (claudeMessages.length === 0) {
         throw new Error("Internal error: empty Marie context");
       }
@@ -298,7 +349,7 @@ export async function POST(req: Request) {
         systemAppend: crossAgentAppend,
       });
     } else {
-      const turns = toOpenAiTurns(historyAfterUser);
+      const turns = toOpenAiTurns(historyForModel);
       if (turns.length === 0) {
         throw new Error("Internal error: empty Roy context");
       }

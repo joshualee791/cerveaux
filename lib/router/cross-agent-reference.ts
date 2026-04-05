@@ -18,19 +18,30 @@ export function detectCrossAgentReference(
   return other;
 }
 
+/** ASCII ' or typographic ’ (U+2019) for possessives */
+const APOST = "['\u2019]";
+
 function referencesOtherAgentByName(text: string, other: "marie" | "roy"): boolean {
   if (other === "marie") {
-    return /\bmarie\b|@marie\b/i.test(text);
+    return (
+      /\bmarie\b|@marie\b/i.test(text) ||
+      new RegExp(`\\bmarie\\s*${APOST}s\\b`, "i").test(text)
+    );
   }
-  return /\broy\b|@roy\b/i.test(text);
+  return (
+    /\broy\b|@roy\b/i.test(text) ||
+    new RegExp(`\\broy\\s*${APOST}s\\b`, "i").test(text)
+  );
 }
 
 /**
  * Reaction / commentary intent — keep deterministic; avoid matching generic mentions.
  */
 function hasReactionOrAnalysisIntent(text: string, other: "marie" | "roy"): boolean {
-  if (other === "marie" && /\bmarie\s*'s\b/i.test(text)) return true;
-  if (other === "roy" && /\broy\s*'s\b/i.test(text)) return true;
+  const possessiveMarie = new RegExp(`\\bmarie\\s*${APOST}s\\b`, "i");
+  const possessiveRoy = new RegExp(`\\broy\\s*${APOST}s\\b`, "i");
+  if (other === "marie" && possessiveMarie.test(text)) return true;
+  if (other === "roy" && possessiveRoy.test(text)) return true;
 
   const named = other === "roy" ? "roy" : "marie";
   if (
@@ -42,7 +53,7 @@ function hasReactionOrAnalysisIntent(text: string, other: "marie" | "roy"): bool
     return true;
   }
 
-  return /\b(what do you think(?:\s+of)?|think about|thoughts?\s+on|tell me about|comment on|critique|critiquing|critiques|analyze|analysing|analyzing|review|reviewing|respond(?:\s+to)?|reply(?:\s+to)?|read|look at|evaluate|evaluating|react(?:\s+to)?|your take|your view|how do you feel about|referring to|in response to)\b/i.test(
+  return /\b(what do you think(?:\s+of)?|what'?s\s+your\s+take\s+on|how\s+do\s+you\s+like|your\s+opinion\s+of|opinion\s+on|think about|thoughts?\s+on|tell me about|comment on|critique|critiquing|critiques|analyze|analysing|analyzing|review|reviewing|respond(?:\s+to)?|reply(?:\s+to)?|read|look at|evaluate|evaluating|react(?:\s+to)?|your take|your view|how do you feel about|referring to|in response to)\b/i.test(
     text,
   );
 }
