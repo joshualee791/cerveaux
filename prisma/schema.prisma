@@ -1,0 +1,55 @@
+// Les Cerveaux — data model per docs/les_cerveaux_master_playbook.md §3
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Conversation {
+  id        String    @id @default(uuid()) @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  title     String
+  messages  Message[]
+  uploads   Upload[]
+
+  @@map("conversations")
+}
+
+model Message {
+  id             String       @id @default(uuid()) @db.Uuid
+  conversationId String       @map("conversation_id") @db.Uuid
+  role           String
+  content        String
+  createdAt      DateTime     @default(now()) @map("created_at")
+  sequence       Int
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@map("messages")
+}
+
+model Memory {
+  id           String   @id @default(uuid()) @db.Uuid
+  agent        String
+  scope        String
+  content      String
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  messageCount Int      @default(0) @map("message_count")
+
+  @@map("memory")
+}
+
+model Upload {
+  id             String       @id @default(uuid()) @db.Uuid
+  conversationId String       @map("conversation_id") @db.Uuid
+  filename       String
+  mimeType       String       @map("mime_type")
+  parsedContent  String       @map("parsed_content")
+  uploadedAt     DateTime     @default(now()) @map("uploaded_at")
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@map("uploads")
+}
