@@ -14,10 +14,13 @@ type Turn = { role: "user" | "assistant"; content: string };
  * - Each agent only receives a filtered projection of that thread (here: `user` + `roy` turns).
  * - Marie’s assistant rows are not duplicated elsewhere and are omitted from Roy’s API payload.
  *
- * Prompt / flow: system = §8 + §9 + empty memory stubs only. `turns` are user/assistant from
- * projected rows; no Joshua or identity text inside turn `content`.
+ * Prompt / flow: system = §8 + §9 + empty memory stubs; optional `systemAppend` adds deferral
+ * for secondary calls. `turns` are user/assistant from projected rows only.
  */
-export async function callRoy(turns: Turn[]): Promise<string> {
+export async function callRoy(
+  turns: Turn[],
+  options?: { systemAppend?: string },
+): Promise<string> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     throw new Error("OPENAI_API_KEY is not set");
@@ -25,7 +28,10 @@ export async function callRoy(turns: Turn[]): Promise<string> {
 
   const client = new OpenAI({ apiKey });
   const model = process.env.OPENAI_MODEL ?? DEFAULT_MODEL;
-  const system = buildRoySystemPrompt();
+  const base = buildRoySystemPrompt();
+  const system = options?.systemAppend
+    ? `${base}\n\n${options.systemAppend}`
+    : base;
 
   const completion = await client.chat.completions.create({
     model,

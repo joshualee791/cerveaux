@@ -13,10 +13,13 @@ type ClaudeTurn = { role: "user" | "assistant"; content: string };
  *   memory stubs; it is passed only via Anthropic’s `system` parameter — never
  *   prepended into `messages[].content`.
  * - `messages` must be alternating user/assistant turns derived from DB user/marie
- *   rows only (see `toClaudeMessages` in the chat route). No system or Joshua
- *   text is injected here.
+ *   rows only (see `toClaudeMessages`). Optional `systemAppend` adds deferral (§5) for
+ *   secondary calls only.
  */
-export async function callMarie(messages: ClaudeTurn[]): Promise<string> {
+export async function callMarie(
+  messages: ClaudeTurn[],
+  options?: { systemAppend?: string },
+): Promise<string> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     throw new Error("ANTHROPIC_API_KEY is not set");
@@ -24,7 +27,10 @@ export async function callMarie(messages: ClaudeTurn[]): Promise<string> {
 
   const client = new Anthropic({ apiKey });
   const model = process.env.ANTHROPIC_MODEL ?? DEFAULT_MODEL;
-  const system = buildMarieSystemPrompt();
+  const base = buildMarieSystemPrompt();
+  const system = options?.systemAppend
+    ? `${base}\n\n${options.systemAppend}`
+    : base;
 
   const response = await client.messages.create({
     model,

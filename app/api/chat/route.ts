@@ -1,20 +1,25 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
+import { buildDeferralPrompt } from "@/lib/deferral";
 import { callMarie } from "@/lib/marie/call-claude";
+import { callRoy } from "@/lib/roy/call-openai";
+import {
+  isUuid,
+  lastAssistantRole,
+  titleFromFirstMessage,
+  toClaudeMessages,
+  toOpenAiTurns,
+} from "@/lib/chat-helpers";
+import { classifyRoute } from "@/lib/router/classify";
 import { prisma } from "@/lib/prisma";
-import { isUuid, titleFromFirstMessage } from "@/lib/chat-helpers";
 
 export const runtime = "nodejs";
 
 /**
- * Marie path — `POST /api/chat`
- *
- * Canonical thread: Prisma stores a single ordered message list per `conversation_id` (user,
- * marie, roy rows may all appear). We do not persist separate threads per agent.
- *
- * Read path: Claude sees only a projection — `user` + `marie` rows in sequence. `roy` assistant
- * rows are left in the DB for the UI but are not sent to Anthropic (Roy-only context is isolated).
+ * Central chat orchestration (Phase 6): router (Haiku) + Marie/Roy + deferral for BOTH.
+ * Canonical thread in `messages`; LLM inputs use role-filtered projections; deferral injects
+ * primary text via system append only for the secondary call (§5).
  */
 
 type Body = {
@@ -22,19 +27,12 @@ type Body = {
   message?: string;
 };
 
-/** Project DB rows for Marie: only `user` and `marie` — Roy replies omitted from Marie’s context. */
-function toClaudeMessages(
-  rows: { role: string; content: string }[],
-): { role: "user" | "assistant"; content: string }[] {
-  const out: { role: "user" | "assistant"; content: string }[] = [];
-  for (const r of rows) {
-    if (r.role === "user") {
-      out.push({ role: "user", content: r.content });
-    } else if (r.role === "marie") {
-      out.push({ role: "assistant", content: r.content });
-    }
-  }
-  return out;
+function priorForRouter(
+  role: "marie" | "roy" | null,
+): "Marie" | "Roy" | "none" {
+  if (role === "marie") return "Marie";
+  if (role === "roy") return "Roy";
+  return "none";
 }
 
 export async function POST(req: Request) {
@@ -72,51 +70,151 @@ export async function POST(req: Request) {
 
   const convId = conversation.id;
 
+  const existing = await prisma.message.findMany({
+    where: { conversationId: convId },
+    orderBy: { sequence: "asc" },
+  });
+
+  const lastAssist = lastAssistantRole(existing);
+  const prior = priorForRouter(lastAssist);
+
   const lastSeq = await prisma.message.aggregate({
     where: { conversationId: convId },
     _max: { sequence: true },
   });
-  const nextSeq = (lastSeq._max.sequence ?? 0) + 1;
+  const userSeq = (lastSeq._max.sequence ?? 0) + 1;
 
   await prisma.message.create({
     data: {
       conversationId: convId,
       role: "user",
       content: raw,
-      sequence: nextSeq,
+      sequence: userSeq,
     },
   });
 
-  const history = await prisma.message.findMany({
+  let route: Awaited<ReturnType<typeof classifyRoute>>;
+  try {
+    route = await classifyRoute(raw, prior);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Router failed";
+    return NextResponse.json({ error: msg }, { status: 502 });
+  }
+
+  const historyAfterUser = await prisma.message.findMany({
     where: { conversationId: convId },
     orderBy: { sequence: "asc" },
   });
 
-  const claudeMessages = toClaudeMessages(history);
-  if (claudeMessages.length === 0) {
-    return NextResponse.json(
-      { error: "Internal error: empty history" },
-      { status: 500 },
-    );
-  }
+  const runMarieOnly = async () => {
+    const claudeMessages = toClaudeMessages(historyAfterUser);
+    if (claudeMessages.length === 0) {
+      throw new Error("Internal error: empty Marie context");
+    }
+    return callMarie(claudeMessages);
+  };
 
-  let marieText: string;
+  const runRoyOnly = async () => {
+    const turns = toOpenAiTurns(historyAfterUser);
+    if (turns.length === 0) {
+      throw new Error("Internal error: empty Roy context");
+    }
+    return callRoy(turns);
+  };
+
   try {
-    marieText = await callMarie(claudeMessages);
+    switch (route) {
+      case "MARIE_ONLY": {
+        const marieText = await runMarieOnly();
+        await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "marie",
+            content: marieText,
+            sequence: userSeq + 1,
+          },
+        });
+        break;
+      }
+      case "ROY_ONLY": {
+        const royText = await runRoyOnly();
+        await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "roy",
+            content: royText,
+            sequence: userSeq + 1,
+          },
+        });
+        break;
+      }
+      case "MARIE_PRIMARY": {
+        const marieText = await runMarieOnly();
+        await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "marie",
+            content: marieText,
+            sequence: userSeq + 1,
+          },
+        });
+        const h2 = await prisma.message.findMany({
+          where: { conversationId: convId },
+          orderBy: { sequence: "asc" },
+        });
+        const deferral = buildDeferralPrompt("Marie", marieText);
+        const royTurns = toOpenAiTurns(h2);
+        if (royTurns.length === 0) {
+          throw new Error("Internal error: empty Roy context after Marie");
+        }
+        const royText = await callRoy(royTurns, { systemAppend: deferral });
+        await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "roy",
+            content: royText,
+            sequence: userSeq + 2,
+          },
+        });
+        break;
+      }
+      case "ROY_PRIMARY": {
+        const royText = await runRoyOnly();
+        await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "roy",
+            content: royText,
+            sequence: userSeq + 1,
+          },
+        });
+        const h2 = await prisma.message.findMany({
+          where: { conversationId: convId },
+          orderBy: { sequence: "asc" },
+        });
+        const deferral = buildDeferralPrompt("Roy", royText);
+        const claudeMessages = toClaudeMessages(h2);
+        if (claudeMessages.length === 0) {
+          throw new Error("Internal error: empty Marie context after Roy");
+        }
+        const marieText = await callMarie(claudeMessages, {
+          systemAppend: deferral,
+        });
+        await prisma.message.create({
+          data: {
+            conversationId: convId,
+            role: "marie",
+            content: marieText,
+            sequence: userSeq + 2,
+          },
+        });
+        break;
+      }
+    }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "Claude request failed";
+    const msg = e instanceof Error ? e.message : "LLM request failed";
     return NextResponse.json({ error: msg }, { status: 502 });
   }
-
-  const marieSeq = nextSeq + 1;
-  await prisma.message.create({
-    data: {
-      conversationId: convId,
-      role: "marie",
-      content: marieText,
-      sequence: marieSeq,
-    },
-  });
 
   const messages = await prisma.message.findMany({
     where: { conversationId: convId },
@@ -126,6 +224,7 @@ export async function POST(req: Request) {
   return NextResponse.json({
     conversationId: convId,
     conversationTitle: conversation.title,
+    route,
     messages: messages.map((m) => ({
       id: m.id,
       role: m.role,

@@ -18,8 +18,6 @@ type LatestResponse = {
   } | null;
 };
 
-type AgentTarget = "marie" | "roy";
-
 export function ChatApp({ userName }: Props) {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [conversationTitle, setConversationTitle] = useState<string | null>(
@@ -30,7 +28,6 @@ export function ChatApp({ userName }: Props) {
   const [sendError, setSendError] = useState<string | null>(null);
   const [loadingThread, setLoadingThread] = useState(true);
   const [sending, setSending] = useState(false);
-  const [agent, setAgent] = useState<AgentTarget>("marie");
   const scrollEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = useCallback(() => {
@@ -88,8 +85,7 @@ export function ChatApp({ userName }: Props) {
     setSending(true);
 
     try {
-      const chatUrl = agent === "marie" ? "/api/chat" : "/api/chat/roy";
-      const res = await fetch(chatUrl, {
+      const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -127,39 +123,8 @@ export function ChatApp({ userName }: Props) {
         <header className="shrink-0 border-b border-neutral-200 bg-white px-4 py-3">
           <h1 className="text-lg font-semibold">Les Cerveaux</h1>
           <p className="text-sm text-neutral-600">
-            Reply from — router / BOTH / deferral not implemented yet.
+            Marie and Roy — routing is automatic (Haiku classifier).
           </p>
-          <div
-            className="mt-3 flex flex-wrap items-center gap-2"
-            role="group"
-            aria-label="Active agent for the next message"
-          >
-            <span className="text-xs font-medium uppercase tracking-wide text-neutral-500">
-              Send to
-            </span>
-            <button
-              type="button"
-              onClick={() => setAgent("marie")}
-              className={`rounded border px-2 py-1 text-sm ${
-                agent === "marie"
-                  ? "border-slate-500 bg-slate-100 font-medium text-neutral-900"
-                  : "border-neutral-300 bg-white text-neutral-700"
-              }`}
-            >
-              Marie
-            </button>
-            <button
-              type="button"
-              onClick={() => setAgent("roy")}
-              className={`rounded border px-2 py-1 text-sm ${
-                agent === "roy"
-                  ? "border-amber-600 bg-amber-50 font-medium text-neutral-900"
-                  : "border-neutral-300 bg-white text-neutral-700"
-              }`}
-            >
-              Roy
-            </button>
-          </div>
         </header>
         {loadError ? (
           <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900">
@@ -180,9 +145,7 @@ export function ChatApp({ userName }: Props) {
         <ChatInput
           onSend={handleSend}
           disabled={sending || loadingThread}
-          placeholder={
-            agent === "marie" ? "Message Marie…" : "Message Roy…"
-          }
+          placeholder="Message…"
         />
       </div>
     </div>
