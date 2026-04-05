@@ -2,7 +2,7 @@
  * §5 Deferral — secondary agent sees primary’s reply in-system; not duplicated in message rows.
  */
 export function buildDeferralPrompt(
-  primaryAgent: "Marie" | "Roy",
+  primaryAgent: "Ada" | "Leo",
   primaryResponse: string,
 ): string {
   return `--- PRIMARY RESPONSE ---

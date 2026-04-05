@@ -2,8 +2,8 @@ import type { MessageRole } from "./types";
 
 function labelForRole(role: MessageRole, userName: string): string {
   if (role === "user") return userName;
-  if (role === "marie") return "Marie";
-  if (role === "roy") return "Roy";
+  if (role === "ada") return "Ada";
+  if (role === "leo") return "Leo";
   return "Assistant";
 }
 
@@ -28,9 +28,9 @@ export function MessageRow({
   const label = labelForRole(role, userName);
 
   const accent =
-    role === "marie"
+    role === "ada"
       ? "border-l-slate-500"
-      : role === "roy"
+      : role === "leo"
         ? "border-amber-600"
         : role === "assistant"
           ? "border-l-neutral-400"

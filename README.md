@@ -1,6 +1,6 @@
 # Les Cerveaux
 
-Personal multi-agent chat: **Marie** (Anthropic Claude) and **Roy** (OpenAI, default GPT‑4.1) share one thread, separate voices, and **persistent per-agent memory**. Built with **Next.js**, **Prisma**, and **PostgreSQL** (e.g. Neon)—no agent frameworks; vanilla API calls only.
+Personal multi-agent chat: **Ada** (Anthropic Claude) and **Leo** (OpenAI, default GPT‑4.1) share one thread, separate voices, and **persistent per-agent memory**. Built with **Next.js**, **Prisma**, and **PostgreSQL** (e.g. Neon)—no agent frameworks; vanilla API calls only.
 
 **Authoritative architecture & security:** [`docs/les_cerveaux_master_playbook.md`](docs/les_cerveaux_master_playbook.md)
 
@@ -17,7 +17,7 @@ Personal multi-agent chat: **Marie** (Anthropic Claude) and **Roy** (OpenAI, def
 | App | Next.js 14 (App Router), React |
 | Auth | NextAuth (credentials), middleware-protected API routes |
 | Data | Prisma + PostgreSQL |
-| LLMs | Claude (Marie), OpenAI (Roy), Haiku-class router (`lib/router/classify.ts`) |
+| LLMs | Claude (Ada), OpenAI (Leo), Haiku-class router (`lib/router/classify.ts`) |
 
 ## Local setup
 
@@ -52,7 +52,7 @@ Apply migrations against your production database after deploy if your host does
 
 ## Routing (high level)
 
-The router assigns **`MARIE_ONLY`**, **`ROY_ONLY`**, or (rarely) **`MARIE_PRIMARY` / `ROY_PRIMARY`** for dual responses with a deferral prompt to the second agent. Explicit `@marie` / `@roy` and leading addressee lines can override classification—see the playbook §4 and the code.
+The router assigns **`ADA_ONLY`**, **`LEO_ONLY`**, or (rarely) **`ADA_PRIMARY` / `LEO_PRIMARY`** for dual responses with a deferral prompt to the second agent. Explicit `@ada` / `@leo` and leading addressee lines can override classification—see the playbook §4 and the code.
 
 ## Docs
 

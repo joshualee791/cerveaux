@@ -17,10 +17,10 @@ function formatTranscript(messages: Message[]): string {
       const who =
         m.role === "user"
           ? "Joshua"
-          : m.role === "marie"
-            ? "Marie"
-            : m.role === "roy"
-              ? "Roy"
+          : m.role === "ada"
+            ? "Ada"
+            : m.role === "leo"
+              ? "Leo"
               : m.role;
       return `${who}: ${m.content}`;
     })
@@ -46,8 +46,8 @@ function parseMemoryJson(text: string): { joshua: string; counterpart: string } 
 }
 
 function buildSummarizerPrompt(params: {
-  agentName: "Marie" | "Roy";
-  counterpartName: "Marie" | "Roy";
+  agentName: "Ada" | "Leo";
+  counterpartName: "Ada" | "Leo";
   currentJoshua: string;
   currentCounterpart: string;
   transcript: string;
@@ -115,7 +115,7 @@ function mergeAgentMemorySnapshot(
 }
 
 async function upsertMemoryRow(
-  agent: "marie" | "roy",
+  agent: "ada" | "leo",
   scope: "joshua" | "counterpart",
   content: string,
   messageCount: number,
@@ -136,8 +136,8 @@ async function upsertMemoryRow(
 }
 
 async function callSummarizerForAgent(params: {
-  agent: "marie" | "roy";
-  counterpartLabel: "Marie" | "Roy";
+  agent: "ada" | "leo";
+  counterpartLabel: "Ada" | "Leo";
   transcript: string;
 }): Promise<{ joshua: string; counterpart: string }> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -159,7 +159,7 @@ async function callSummarizerForAgent(params: {
   const client = new Anthropic({ apiKey });
 
   const userPrompt = buildSummarizerPrompt({
-    agentName: params.agent === "marie" ? "Marie" : "Roy",
+    agentName: params.agent === "ada" ? "Ada" : "Leo",
     counterpartName: params.counterpartLabel,
     currentJoshua: current.joshua,
     currentCounterpart: current.counterpart,
@@ -277,61 +277,61 @@ async function runMemorySummarization(conversationId: string): Promise<void> {
 
   const transcript = formatTranscript(messages);
 
-  let marie: { joshua: string; counterpart: string };
-  let roy: { joshua: string; counterpart: string };
+  let ada: { joshua: string; counterpart: string };
+  let leo: { joshua: string; counterpart: string };
 
-  const memoryBeforeMarie = await getAgentMemory("marie");
-  const memoryBeforeRoy = await getAgentMemory("roy");
+  const memoryBeforeAda = await getAgentMemory("ada");
+  const memoryBeforeLeo = await getAgentMemory("leo");
 
-  console.log("[memory/debug] Marie summarization starting", {
+  console.log("[memory/debug] Ada summarization starting", {
     conversationId,
     transcriptChars: transcript.length,
   });
   try {
-    const marieRaw = await callSummarizerForAgent({
-      agent: "marie",
-      counterpartLabel: "Roy",
+    const adaRaw = await callSummarizerForAgent({
+      agent: "ada",
+      counterpartLabel: "Leo",
       transcript,
     });
-    marie = mergeAgentMemorySnapshot(memoryBeforeMarie, marieRaw);
-    console.log("[memory/debug] Marie summarization finished ok", {
+    ada = mergeAgentMemorySnapshot(memoryBeforeAda, adaRaw);
+    console.log("[memory/debug] Ada summarization finished ok", {
       conversationId,
     });
   } catch (e) {
-    console.error("[memory/debug] Marie summarization failed", {
+    console.error("[memory/debug] Ada summarization failed", {
       conversationId,
       error: e instanceof Error ? e.message : String(e),
     });
-    console.error("[memory/summarize] Marie summarization failed", e);
+    console.error("[memory/summarize] Ada summarization failed", e);
     return;
   }
 
-  console.log("[memory/debug] Roy summarization starting", { conversationId });
+  console.log("[memory/debug] Leo summarization starting", { conversationId });
   try {
-    const royRaw = await callSummarizerForAgent({
-      agent: "roy",
-      counterpartLabel: "Marie",
+    const leoRaw = await callSummarizerForAgent({
+      agent: "leo",
+      counterpartLabel: "Ada",
       transcript,
     });
-    roy = mergeAgentMemorySnapshot(memoryBeforeRoy, royRaw);
-    console.log("[memory/debug] Roy summarization finished ok", {
+    leo = mergeAgentMemorySnapshot(memoryBeforeLeo, leoRaw);
+    console.log("[memory/debug] Leo summarization finished ok", {
       conversationId,
     });
   } catch (e) {
-    console.error("[memory/debug] Roy summarization failed", {
+    console.error("[memory/debug] Leo summarization failed", {
       conversationId,
       error: e instanceof Error ? e.message : String(e),
     });
-    console.error("[memory/summarize] Roy summarization failed", e);
+    console.error("[memory/summarize] Leo summarization failed", e);
     return;
   }
 
   console.log("[memory/debug] memory table upserts starting", { conversationId });
   try {
-    await upsertMemoryRow("marie", "joshua", marie.joshua, convMessageCount);
-    await upsertMemoryRow("marie", "counterpart", marie.counterpart, convMessageCount);
-    await upsertMemoryRow("roy", "joshua", roy.joshua, convMessageCount);
-    await upsertMemoryRow("roy", "counterpart", roy.counterpart, convMessageCount);
+    await upsertMemoryRow("ada", "joshua", ada.joshua, convMessageCount);
+    await upsertMemoryRow("ada", "counterpart", ada.counterpart, convMessageCount);
+    await upsertMemoryRow("leo", "joshua", leo.joshua, convMessageCount);
+    await upsertMemoryRow("leo", "counterpart", leo.counterpart, convMessageCount);
     console.log("[memory/debug] memory table upserts completed", {
       conversationId,
     });

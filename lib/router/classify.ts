@@ -5,37 +5,39 @@ const ROUTER_MODEL =
   process.env.ANTHROPIC_ROUTER_MODEL ?? "claude-haiku-4-5";
 
 export type RouteLabel =
-  | "MARIE_ONLY"
-  | "ROY_ONLY"
-  | "MARIE_PRIMARY"
-  | "ROY_PRIMARY";
+  | "ADA_ONLY"
+  | "LEO_ONLY"
+  | "ADA_PRIMARY"
+  | "LEO_PRIMARY"
+  /** Heuristic group check-in; both agents respond without deferral framing (set in route, not Haiku). */
+  | "COMMUNAL_DUAL";
 
 const CLASSIFIER_PROMPT = `You route each user message to exactly one label:
 
-MARIE_ONLY, ROY_ONLY, MARIE_PRIMARY, ROY_PRIMARY
+ADA_ONLY, LEO_ONLY, ADA_PRIMARY, LEO_PRIMARY
 
-Default outcomes are MARIE_ONLY and ROY_ONLY. Prefer MARIE_ONLY or ROY_ONLY when a single agent can reasonably answer the question.
+Default outcomes are ADA_ONLY and LEO_ONLY. Prefer ADA_ONLY or LEO_ONLY when a single agent can reasonably answer the question.
 
-Use MARIE_PRIMARY or ROY_PRIMARY sparingly — only when:
+Use ADA_PRIMARY or LEO_PRIMARY sparingly — only when:
 - the question clearly benefits from two distinct perspectives (technical + human/meaning), OR
 - it is explicitly ambiguous or mixed (e.g. both engineering and emotional content without a clear lean).
 
 Do not use PRIMARY states for simple, single-topic, or routine messages.
 
-MARIE_ONLY: technical, architectural, implementation, systems, tooling — or user addresses Marie. Default for strong technical topics.
-ROY_ONLY: conceptual, philosophical, emotional, meaning-making — or user addresses Roy. Default for strong emotional/conceptual topics.
-MARIE_PRIMARY: rare — needs both agents; Marie should speak first (technical-led mixed question).
-ROY_PRIMARY: rare — needs both agents; Roy should speak first (human-led mixed question).
+ADA_ONLY: technical, architectural, implementation, systems, tooling — or user addresses Ada. Default for strong technical topics.
+LEO_ONLY: conceptual, philosophical, emotional, meaning-making — or user addresses Leo. Default for strong emotional/conceptual topics.
+ADA_PRIMARY: rare — needs both agents; Ada should speak first (technical-led mixed question).
+LEO_PRIMARY: rare — needs both agents; Leo should speak first (human-led mixed question).
 
 Message:
 `;
 
-/** Strong technical lean → single agent Marie (do not route to BOTH unless mixed). */
+/** Strong technical lean → single agent Ada (do not route to BOTH unless mixed). */
 function hasStrongTechnicalSignal(message: string): boolean {
   return /\b(design|architecture|api|database|scaling)\b/i.test(message);
 }
 
-/** Strong emotional/conceptual lean → single agent Roy (do not route to BOTH unless mixed). */
+/** Strong emotional/conceptual lean → single agent Leo (do not route to BOTH unless mixed). */
 function hasStrongEmotionalSignal(message: string): boolean {
   return (
     /\bi\s+feel\b/i.test(message) ||
@@ -47,7 +49,7 @@ function hasStrongEmotionalSignal(message: string): boolean {
 /**
  * When the model returns PRIMARY but the message clearly fits one domain,
  * prefer a single agent. When both domains fire, treat as genuinely mixed — keep the model label.
- * Does not rewrite ROY_ONLY → MARIE_ONLY on technical heuristics (explicit / classifier Roy must stay Roy).
+ * Does not rewrite LEO_ONLY → ADA_ONLY on technical heuristics (explicit / classifier Leo must stay Leo).
  */
 function applyDomainSignals(
   message: string,
@@ -60,18 +62,18 @@ function applyDomainSignals(
     return label;
   }
   if (technical) {
-    if (label === "MARIE_PRIMARY" || label === "ROY_PRIMARY") {
-      return "MARIE_ONLY";
+    if (label === "ADA_PRIMARY" || label === "LEO_PRIMARY") {
+      return "ADA_ONLY";
     }
     return label;
   }
   if (emotional) {
     if (
-      label === "MARIE_PRIMARY" ||
-      label === "ROY_PRIMARY" ||
-      label === "MARIE_ONLY"
+      label === "ADA_PRIMARY" ||
+      label === "LEO_PRIMARY" ||
+      label === "ADA_ONLY"
     ) {
-      return "ROY_ONLY";
+      return "LEO_ONLY";
     }
     return label;
   }
@@ -84,7 +86,7 @@ function applyDomainSignals(
  */
 export async function classifyRoute(
   userMessage: string,
-  priorAgent: "Marie" | "Roy" | "none",
+  priorAgent: "Ada" | "Leo" | "none",
 ): Promise<RouteLabel> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -97,7 +99,7 @@ export async function classifyRoute(
 
 Prior turn agent (if continuation): ${priorLine}
 
-Reply with exactly one token: MARIE_ONLY, ROY_ONLY, MARIE_PRIMARY, or ROY_PRIMARY.`;
+Reply with exactly one token: ADA_ONLY, LEO_ONLY, ADA_PRIMARY, or LEO_PRIMARY.`;
 
   const client = new Anthropic({ apiKey });
 
@@ -110,7 +112,7 @@ Reply with exactly one token: MARIE_ONLY, ROY_ONLY, MARIE_PRIMARY, or ROY_PRIMAR
   const block = response.content[0];
   let raw = "";
   if (!block || block.type !== "text") {
-    const final: RouteLabel = "ROY_ONLY";
+    const final: RouteLabel = "LEO_ONLY";
     console.log("[router/classify]", {
       rawClassifierResponse: raw,
       parsedLabel: null,
@@ -122,11 +124,11 @@ Reply with exactly one token: MARIE_ONLY, ROY_ONLY, MARIE_PRIMARY, or ROY_PRIMAR
   raw = block.text;
   const upper = raw.trim().toUpperCase();
   const m = upper.match(
-    /\b(MARIE_ONLY|ROY_ONLY|MARIE_PRIMARY|ROY_PRIMARY)\b/,
+    /\b(ADA_ONLY|LEO_ONLY|ADA_PRIMARY|LEO_PRIMARY)\b/,
   );
   let parsed: RouteLabel | null = m ? (m[1] as RouteLabel) : null;
   if (!parsed) {
-    const final: RouteLabel = "ROY_ONLY";
+    const final: RouteLabel = "LEO_ONLY";
     console.log("[router/classify]", {
       rawClassifierResponse: raw,
       parsedLabel: null,

@@ -2,22 +2,21 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { buildDeferralPrompt } from "@/lib/deferral";
-import { callMarie, streamMarie } from "@/lib/marie/call-claude";
-import { callRoy, streamRoy } from "@/lib/roy/call-openai";
+import { callAda, streamAda } from "@/lib/ada/call-claude";
+import { callLeo, streamLeo } from "@/lib/leo/call-openai";
 import {
   isUuid,
   lastAssistantRole,
   titleFromFirstMessage,
-  toClaudeMessages,
-  toOpenAiTurns,
+  toSharedAgentMessages,
 } from "@/lib/chat-helpers";
 import { DEFAULT_CONVERSATION_TITLE } from "@/lib/conversation-defaults";
 import { classifyRoute, type RouteLabel } from "@/lib/router/classify";
 import {
-  buildCrossAgentReferenceContextAppend,
-  detectCrossAgentReference,
-  recentReferencedAgentContextWindow,
-} from "@/lib/router/cross-agent-reference";
+  buildCommunalSecondaryPrompt,
+  COMMUNAL_PRIMARY_APPEND,
+  detectCommunalPrompt,
+} from "@/lib/router/communal";
 import { getAgentMemory } from "@/lib/memory/read";
 import { scheduleMemorySummarization } from "@/lib/memory/summarize";
 import { prisma } from "@/lib/prisma";
@@ -26,7 +25,7 @@ import type { Message } from "@prisma/client";
 export const runtime = "nodejs";
 
 /**
- * Central chat orchestration: router + Marie/Roy + deferral for BOTH.
+ * Central chat orchestration: router + Ada/Leo + deferral for BOTH.
  * Memory read per agent (§10); summarization scheduled after response (async).
  */
 
@@ -44,10 +43,10 @@ type ChatMessageDTO = {
 };
 
 function priorForRouter(
-  role: "marie" | "roy" | null,
-): "Marie" | "Roy" | "none" {
-  if (role === "marie") return "Marie";
-  if (role === "roy") return "Roy";
+  role: "ada" | "leo" | null,
+): "Ada" | "Leo" | "none" {
+  if (role === "ada") return "Ada";
+  if (role === "leo") return "Leo";
   return "none";
 }
 
@@ -61,14 +60,14 @@ function toDto(m: Message): ChatMessageDTO {
   };
 }
 
-/** Optional opener so "Hey Roy, …" resolves before global @mentions. */
+/** Optional opener so "Hey Leo, …" resolves before global @mentions. */
 const LEADING_GREETING = /^(?:Hi|Hey|Hello|Ok|Okay|So|Well)(?:,|\s+)\s*/i;
 
 /**
- * Leading addressee only (after trim). Greeting + Marie/Roy/@marie/@roy at effective start.
- * Checked before global @mention scan so "Roy, … @marie" still targets Roy.
+ * Leading addressee only (after trim). Greeting + Ada/Leo/@ada/@leo at effective start.
+ * Checked before global @mention scan so "Leo, … @ada" still targets Leo.
  */
-function leadingExplicitAgentTarget(t: string): "marie" | "roy" | null {
+function leadingExplicitAgentTarget(t: string): "ada" | "leo" | null {
   let s = t;
   const gm = t.match(LEADING_GREETING);
   if (gm) {
@@ -76,56 +75,56 @@ function leadingExplicitAgentTarget(t: string): "marie" | "roy" | null {
   }
   if (!s) return null;
 
-  if (/^@marie\b/i.test(s)) return "marie";
-  if (/^@roy\b/i.test(s)) return "roy";
+  if (/^@ada\b/i.test(s)) return "ada";
+  if (/^@leo\b/i.test(s)) return "leo";
 
   if (
-    /^marie\s*:/i.test(s) ||
-    /^marie\s*\?/i.test(s) ||
-    /^marie\b/i.test(s)
+    /^ada\s*:/i.test(s) ||
+    /^ada\s*\?/i.test(s) ||
+    /^ada\b/i.test(s)
   ) {
-    return "marie";
+    return "ada";
   }
   if (
-    /^roy\s*:/i.test(s) ||
-    /^roy\s*\?/i.test(s) ||
-    /^roy\b/i.test(s)
+    /^leo\s*:/i.test(s) ||
+    /^leo\s*\?/i.test(s) ||
+    /^leo\b/i.test(s)
   ) {
-    return "roy";
+    return "leo";
   }
   return null;
 }
 
 /**
- * Trailing addressee: "…, Roy" / "…, Marie" / "… Roy?" at end (common in questions).
+ * Trailing addressee: "…, Leo" / "…, Ada" / "… Leo?" at end (common in questions).
  */
-function trailingExplicitAgentTarget(t: string): "marie" | "roy" | null {
+function trailingExplicitAgentTarget(t: string): "ada" | "leo" | null {
   const s = t.trim();
-  if (/,+\s*Roy\s*[?.!]?\s*$/i.test(s)) return "roy";
-  if (/,+\s*Marie\s*[?.!]?\s*$/i.test(s)) return "marie";
-  if (/\bRoy\s*\?\s*$/i.test(s)) return "roy";
-  if (/\bMarie\s*\?\s*$/i.test(s)) return "marie";
+  if (/,+\s*Leo\s*[?.!]?\s*$/i.test(s)) return "leo";
+  if (/,+\s*Ada\s*[?.!]?\s*$/i.test(s)) return "ada";
+  if (/\bLeo\s*\?\s*$/i.test(s)) return "leo";
+  if (/\bAda\s*\?\s*$/i.test(s)) return "ada";
   return null;
 }
 
 /**
- * Mid-message direct address: "Roy can you …", "Marie what …" — bounded to avoid
- * casual mentions ("Roy can swim"). Runs after @mentions per priority order.
+ * Mid-message direct address: "Leo can you …", "Ada what …" — bounded to avoid
+ * casual mentions ("Leo can swim"). Runs after @mentions per priority order.
  */
-function naturalAddressExplicitTarget(t: string): "marie" | "roy" | null {
+function naturalAddressExplicitTarget(t: string): "ada" | "leo" | null {
   const re =
-    /\b(roy|marie)\b,?\s+(?:can\s+you|could\s+you|would\s+you|will\s+you|would\s+you\s+mind|what|how|please|do\s+you|did\s+you)\b/gi;
+    /\b(leo|ada)\b,?\s+(?:can\s+you|could\s+you|would\s+you|will\s+you|would\s+you\s+mind|what|how|please|do\s+you|did\s+you)\b/gi;
   const m = re.exec(t);
   if (!m) return null;
-  return m[1].toLowerCase() === "roy" ? "roy" : "marie";
+  return m[1].toLowerCase() === "leo" ? "leo" : "ada";
 }
 
 /**
  * Deterministic explicit addressee — overrides Haiku classification when set.
- * Priority: leading address; trailing ", Roy" / ", Marie"; @marie/@roy;
- * natural mid-message direct address (e.g. "lol well done. Roy can you …").
+ * Priority: leading address; trailing ", Leo" / ", Ada"; @ada/@leo;
+ * natural mid-message direct address (e.g. "lol well done. Leo can you …").
  */
-function explicitAgentTarget(raw: string): "marie" | "roy" | null {
+function explicitAgentTarget(raw: string): "ada" | "leo" | null {
   const t = raw.trim();
   if (!t) return null;
 
@@ -135,13 +134,13 @@ function explicitAgentTarget(raw: string): "marie" | "roy" | null {
   const trailing = trailingExplicitAgentTarget(t);
   if (trailing) return trailing;
 
-  const idxMarie = t.search(/@marie\b/i);
-  const idxRoy = t.search(/@roy\b/i);
-  if (idxMarie >= 0 || idxRoy >= 0) {
-    if (idxRoy === -1 || (idxMarie >= 0 && idxMarie <= idxRoy)) {
-      return "marie";
+  const idxAda = t.search(/@ada\b/i);
+  const idxLeo = t.search(/@leo\b/i);
+  if (idxAda >= 0 || idxLeo >= 0) {
+    if (idxLeo === -1 || (idxAda >= 0 && idxAda <= idxLeo)) {
+      return "ada";
     }
-    return "roy";
+    return "leo";
   }
 
   const natural = naturalAddressExplicitTarget(t);
@@ -243,10 +242,12 @@ export async function POST(req: Request) {
   const targeted = explicitAgentTarget(raw);
 
   let route: RouteLabel;
-  if (targeted === "marie") {
-    route = "MARIE_ONLY";
-  } else if (targeted === "roy") {
-    route = "ROY_ONLY";
+  if (targeted === "ada") {
+    route = "ADA_ONLY";
+  } else if (targeted === "leo") {
+    route = "LEO_ONLY";
+  } else if (detectCommunalPrompt(raw)) {
+    route = "COMMUNAL_DUAL";
   } else {
     try {
       route = await classifyRoute(raw, prior);
@@ -256,20 +257,27 @@ export async function POST(req: Request) {
     }
   }
 
-  const streamingRole: "marie" | "roy" =
-    route === "MARIE_ONLY" || route === "MARIE_PRIMARY" ? "marie" : "roy";
+  const streamingRole: "ada" | "leo" =
+    route === "ADA_ONLY" ||
+    route === "ADA_PRIMARY" ||
+    route === "COMMUNAL_DUAL"
+      ? "ada"
+      : "leo";
 
   const executingPrimary =
-    route === "MARIE_ONLY" || route === "MARIE_PRIMARY"
-      ? "streamMarie"
-      : "streamRoy";
+    route === "ADA_ONLY" ||
+    route === "ADA_PRIMARY" ||
+    route === "COMMUNAL_DUAL"
+      ? "streamAda"
+      : "streamLeo";
   console.log("[router/debug]", {
     explicitTarget:
-      targeted === null ? null : targeted === "marie" ? "MARIE" : "ROY",
+      targeted === null ? null : targeted === "ada" ? "ADA" : "LEO",
     finalRoute: route,
     executing: executingPrimary,
     streamingRole,
-    classifierSkipped: targeted !== null,
+    classifierSkipped: targeted !== null || route === "COMMUNAL_DUAL",
+    communalDual: route === "COMMUNAL_DUAL",
   });
 
   return ndjsonResponse(async (send) => {
@@ -294,47 +302,9 @@ export async function POST(req: Request) {
 
     const startMessages: ChatMessageDTO[] = historyForModel.map(toDto);
 
-    const onlyRoute = route === "MARIE_ONLY" || route === "ROY_ONLY";
-    const crossAgentGateOpen =
-      onlyRoute &&
-      (targeted === null || targeted === streamingRole);
-
-    const refProbe = onlyRoute
-      ? detectCrossAgentReference(raw, streamingRole)
-      : null;
-
-    let crossAgentAppend: string | undefined;
-    let refWindow: { sequence: number; content: string }[] = [];
-
-    if (crossAgentGateOpen && refProbe) {
-      const rows = recentReferencedAgentContextWindow(
-        historyForModel,
-        refProbe,
-      );
-      refWindow = rows.map((m) => ({
-        sequence: m.sequence,
-        content: m.content,
-      }));
-      crossAgentAppend = buildCrossAgentReferenceContextAppend(
-        refProbe,
-        refWindow,
-      );
-    }
-
-    const appendCharLen = crossAgentAppend?.length ?? 0;
-    console.log("[cross-agent/debug]", {
-      explicitTarget:
-        targeted === null ? null : targeted === "marie" ? "MARIE" : "ROY",
-      finalRoute: route,
-      streamingRole,
-      crossAgentGateOpen,
-      referenceDetected: refProbe !== null,
-      referencedAgent:
-        refProbe === null ? null : refProbe === "marie" ? "MARIE" : "ROY",
-      referencedMessageCount: crossAgentGateOpen && refProbe ? refWindow.length : 0,
-      appendBuilt: crossAgentAppend !== undefined,
-      appendCharLength: appendCharLen,
-      appendPassedToStream: crossAgentAppend !== undefined,
+    console.log("[context/debug]", {
+      conversationId: convId,
+      dbMessageCount: historyForModel.length,
     });
 
     send({
@@ -353,25 +323,29 @@ export async function POST(req: Request) {
     const primaryMem = await getAgentMemory(streamingRole);
 
     let primaryText: string;
-    if (route === "MARIE_ONLY" || route === "MARIE_PRIMARY") {
-      const claudeMessages = toClaudeMessages(historyForModel);
+    if (
+      route === "ADA_ONLY" ||
+      route === "ADA_PRIMARY" ||
+      route === "COMMUNAL_DUAL"
+    ) {
+      const claudeMessages = toSharedAgentMessages(historyForModel);
       if (claudeMessages.length === 0) {
-        throw new Error("Internal error: empty Marie context");
+        throw new Error("Internal error: empty Ada context");
       }
-      primaryText = await streamMarie(claudeMessages, {
+      primaryText = await streamAda(claudeMessages, {
         onDelta,
         memory: primaryMem,
-        systemAppend: crossAgentAppend,
+        systemAppend:
+          route === "COMMUNAL_DUAL" ? COMMUNAL_PRIMARY_APPEND : undefined,
       });
     } else {
-      const turns = toOpenAiTurns(historyForModel);
+      const turns = toSharedAgentMessages(historyForModel);
       if (turns.length === 0) {
-        throw new Error("Internal error: empty Roy context");
+        throw new Error("Internal error: empty Leo context");
       }
-      primaryText = await streamRoy(turns, {
+      primaryText = await streamLeo(turns, {
         onDelta,
         memory: primaryMem,
-        systemAppend: crossAgentAppend,
       });
     }
 
@@ -387,56 +361,81 @@ export async function POST(req: Request) {
 
     send({ type: "primary_saved", message: toDto(primaryRow) });
 
-    if (route === "MARIE_PRIMARY") {
+    if (route === "COMMUNAL_DUAL") {
       const h2 = await prisma.message.findMany({
         where: { conversationId: convId },
         orderBy: { sequence: "asc" },
       });
-      const deferral = buildDeferralPrompt("Marie", primaryText);
-      const royTurns = toOpenAiTurns(h2);
-      if (royTurns.length === 0) {
-        throw new Error("Internal error: empty Roy context after Marie");
+      const leoTurns = toSharedAgentMessages(h2);
+      if (leoTurns.length === 0) {
+        throw new Error("Internal error: empty Leo context after communal Ada");
       }
-      const royMem = await getAgentMemory("roy");
-      const royText = await callRoy(royTurns, {
-        systemAppend: deferral,
-        memory: royMem,
+      const leoMem = await getAgentMemory("leo");
+      const leoText = await callLeo(leoTurns, {
+        systemAppend: buildCommunalSecondaryPrompt("Ada"),
+        memory: leoMem,
       });
-      const royRow = await prisma.message.create({
+      const leoRow = await prisma.message.create({
         data: {
           conversationId: convId,
-          role: "roy",
-          content: royText,
+          role: "leo",
+          content: leoText,
           sequence: userSeq + 2,
         },
       });
-      send({ type: "secondary_saved", message: toDto(royRow) });
+      send({ type: "secondary_saved", message: toDto(leoRow) });
     }
 
-    if (route === "ROY_PRIMARY") {
+    if (route === "ADA_PRIMARY") {
       const h2 = await prisma.message.findMany({
         where: { conversationId: convId },
         orderBy: { sequence: "asc" },
       });
-      const deferral = buildDeferralPrompt("Roy", primaryText);
-      const claudeMessages = toClaudeMessages(h2);
-      if (claudeMessages.length === 0) {
-        throw new Error("Internal error: empty Marie context after Roy");
+      const deferral = buildDeferralPrompt("Ada", primaryText);
+      const leoTurns = toSharedAgentMessages(h2);
+      if (leoTurns.length === 0) {
+        throw new Error("Internal error: empty Leo context after Ada");
       }
-      const marieMem = await getAgentMemory("marie");
-      const marieText = await callMarie(claudeMessages, {
+      const leoMem = await getAgentMemory("leo");
+      const leoText = await callLeo(leoTurns, {
         systemAppend: deferral,
-        memory: marieMem,
+        memory: leoMem,
       });
-      const marieRow = await prisma.message.create({
+      const leoRow = await prisma.message.create({
         data: {
           conversationId: convId,
-          role: "marie",
-          content: marieText,
+          role: "leo",
+          content: leoText,
           sequence: userSeq + 2,
         },
       });
-      send({ type: "secondary_saved", message: toDto(marieRow) });
+      send({ type: "secondary_saved", message: toDto(leoRow) });
+    }
+
+    if (route === "LEO_PRIMARY") {
+      const h2 = await prisma.message.findMany({
+        where: { conversationId: convId },
+        orderBy: { sequence: "asc" },
+      });
+      const deferral = buildDeferralPrompt("Leo", primaryText);
+      const claudeMessages = toSharedAgentMessages(h2);
+      if (claudeMessages.length === 0) {
+        throw new Error("Internal error: empty Ada context after Leo");
+      }
+      const adaMem = await getAgentMemory("ada");
+      const adaText = await callAda(claudeMessages, {
+        systemAppend: deferral,
+        memory: adaMem,
+      });
+      const adaRow = await prisma.message.create({
+        data: {
+          conversationId: convId,
+          role: "ada",
+          content: adaText,
+          sequence: userSeq + 2,
+        },
+      });
+      send({ type: "secondary_saved", message: toDto(adaRow) });
     }
 
     const messages = await prisma.message.findMany({

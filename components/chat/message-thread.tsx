@@ -6,8 +6,8 @@ import type { MessageRole } from "./types";
 function roleForUi(role: string): MessageRole | null {
   if (
     role === "user" ||
-    role === "marie" ||
-    role === "roy" ||
+    role === "ada" ||
+    role === "leo" ||
     role === "assistant"
   )
     return role;

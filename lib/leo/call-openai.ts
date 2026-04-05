@@ -1,28 +1,31 @@
 import OpenAI from "openai";
 import {
-  buildRoySystemPrompt,
-  type RoyMemoryInjection,
-} from "@/lib/prompts/roy-system";
+  buildLeoSystemPrompt,
+  type LeoMemoryInjection,
+} from "@/lib/prompts/leo-system";
+import { LABELED_THREAD_GUIDANCE } from "@/lib/prompts/labeled-thread";
 
 /** Default when `OPENAI_MODEL` is unset — GPT-4.1 per OpenAI: strong instruction following vs GPT-4o. */
 const DEFAULT_MODEL = "gpt-4.1";
 
 type Turn = { role: "user" | "assistant"; content: string };
 
+function withLabeledThreadSystem(
+  basePrompt: string,
+  systemAppend?: string,
+): string {
+  const core = `${basePrompt}\n\n${LABELED_THREAD_GUIDANCE}`;
+  return systemAppend ? `${core}\n\n${systemAppend}` : core;
+}
+
 /**
- * Roy-only OpenAI call (Phase 5).
+ * Leo-only OpenAI call (Phase 5).
  *
- * Thread model (storage vs read):
- * - The database keeps one chronological thread per `conversation` (all `messages` rows).
- * - Each agent only receives a filtered projection of that thread (here: `user` + `roy` turns).
- * - Marie’s assistant rows are not duplicated elsewhere and are omitted from Roy’s API payload.
- *
- * Prompt / flow: system = §8 + §9 + §10 memory; optional `systemAppend` adds deferral
- * for secondary calls. `turns` are user/assistant from projected rows only.
+ * Messages use `toSharedAgentMessages` — labeled [Joshua]/[Ada]/[Leo] transcript.
  */
-export async function callRoy(
+export async function callLeo(
   turns: Turn[],
-  options?: { systemAppend?: string; memory?: RoyMemoryInjection },
+  options?: { systemAppend?: string; memory?: LeoMemoryInjection },
 ): Promise<string> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -31,15 +34,12 @@ export async function callRoy(
 
   const client = new OpenAI({ apiKey });
   const model = process.env.OPENAI_MODEL ?? DEFAULT_MODEL;
-  const base = buildRoySystemPrompt(options?.memory);
-  const system = options?.systemAppend
-    ? `${base}\n\n${options.systemAppend}`
-    : base;
+  const base = buildLeoSystemPrompt(options?.memory);
+  const system = withLabeledThreadSystem(base, options?.systemAppend);
 
   const completion = await client.chat.completions.create({
     model,
     messages: [{ role: "system", content: system }, ...turns],
-    // Hardcoded tuning (Phase 5 refinement): calmer sampling than API default; not env-configured.
     temperature: 0.65,
     top_p: 1,
   });
@@ -52,15 +52,15 @@ export async function callRoy(
 }
 
 /**
- * Stream Roy’s reply chunk-by-chunk; full text matches a non-streaming call.
- * Primary turn in POST /api/chat; deferral still uses {@link callRoy}.
+ * Stream Leo’s reply chunk-by-chunk; full text matches a non-streaming call.
+ * Primary turn in POST /api/chat; deferral still uses {@link callLeo}.
  */
-export async function streamRoy(
+export async function streamLeo(
   turns: Turn[],
   options: {
     systemAppend?: string;
     onDelta: (chunk: string) => void;
-    memory?: RoyMemoryInjection;
+    memory?: LeoMemoryInjection;
   },
 ): Promise<string> {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -70,10 +70,8 @@ export async function streamRoy(
 
   const client = new OpenAI({ apiKey });
   const model = process.env.OPENAI_MODEL ?? DEFAULT_MODEL;
-  const base = buildRoySystemPrompt(options.memory);
-  const system = options.systemAppend
-    ? `${base}\n\n${options.systemAppend}`
-    : base;
+  const base = buildLeoSystemPrompt(options.memory);
+  const system = withLabeledThreadSystem(base, options.systemAppend);
 
   const stream = await client.chat.completions.create({
     model,

@@ -9,7 +9,7 @@ export type AgentMemory = {
  * Read persistent memory for one agent (§10). Missing rows → empty strings; never throws.
  */
 export async function getAgentMemory(
-  agent: "marie" | "roy",
+  agent: "ada" | "leo",
 ): Promise<AgentMemory> {
   try {
     const [joshuaRow, counterpartRow] = await Promise.all([

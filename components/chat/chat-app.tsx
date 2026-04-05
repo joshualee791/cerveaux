@@ -26,7 +26,7 @@ type NdjsonEvent =
       conversationId: string;
       conversationTitle: string;
       route: string;
-      streamingRole: "marie" | "roy";
+      streamingRole: "ada" | "leo";
       messages: ChatMessageDTO[];
     }
   | { type: "delta"; text: string }
@@ -379,7 +379,7 @@ export function ChatApp({ userName }: Props) {
         <header className="shrink-0 border-b border-neutral-200 bg-white px-4 py-3">
           <h1 className="text-lg font-semibold">Les Cerveaux</h1>
           <p className="text-sm text-neutral-600">
-            Marie and Roy — two perspectives, one conversation.
+            Ada and Leo — two perspectives, one conversation.
           </p>
         </header>
         {loadError ? (
